@@ -24,6 +24,8 @@ import type {
 } from './types.js';
 
 export interface RenderExecutor {
+  /** False after resource quarantine, ancestor pressure, or owner loss. */
+  accepting?(): boolean;
   execute(request: RenderExecutionRequest): Promise<RenderExecutionResult>;
 }
 
@@ -231,13 +233,14 @@ export class InProcessExecutor implements RenderExecutor {
         ];
         const actualCaptureMode =
           observedModes.length === 1 ? observedModes[0]! : result.plan.captureMode;
+        const actualWorkers = Math.max(...result.chunks.map((chunk) => chunk.workers));
         const chunkMetrics: RenderExecutionMetrics = {
           resourceProfile: config.resourceProfile.name,
           capturePolicy: config.resourceProfile.capturePolicy,
           requestedCaptureMode: config.resourceProfile.requestedCaptureMode,
           actualCaptureMode,
           requestedWorkers: config.producerWorkers,
-          actualWorkers: result.plan.chunkWorkers,
+          actualWorkers,
           versions: this.runtimeVersions,
         };
         if (
@@ -260,7 +263,7 @@ export class InProcessExecutor implements RenderExecutor {
           performance: {
             totalElapsedMs: result.totalElapsedMs,
             stages: { ...result.stages },
-            workers: result.plan.chunkWorkers,
+            workers: actualWorkers,
             totalFrames: result.plan.totalFrames,
           },
           metrics: chunkMetrics,

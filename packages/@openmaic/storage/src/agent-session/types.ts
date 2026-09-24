@@ -78,6 +78,7 @@ export interface AgentSessionMeta {
   id: string;
   ownerId: string;
   prompt: string;
+  title?: string;
   /** The immutable stage with which the conversation was created. */
   stageId: string;
   skillId?: string;
@@ -104,6 +105,8 @@ export interface CreateAgentSessionInput {
   skillId?: string;
   origin?: string;
   existingCourse?: boolean;
+  /** New callers opt into the one-shot automatic-title lifecycle explicitly. */
+  titleState?: 'pending';
   /** Existing-course sessions may begin terminal and requeue on the first message. */
   status?: 'queued' | 'succeeded';
 }
@@ -341,6 +344,24 @@ export interface AgentSessionStore {
   mergeOwner(fromOwnerId: string, toOwnerId: string): Promise<number>;
 }
 
+export interface AgentSessionTitleStore {
+  setManualSessionTitle(
+    sessionId: string,
+    ownerId: string,
+    title: string | null,
+  ): Promise<AgentSessionMeta | null>;
+}
+
+/** One-shot automatic-title state transitions, separate from lifecycle authority. */
+export interface AgentSessionAutomaticTitleStore {
+  claimAutomaticSessionTitle(sessionId: string, ownerId: string): Promise<string | null>;
+  setAutomaticSessionTitle(
+    sessionId: string,
+    ownerId: string,
+    title: string,
+  ): Promise<AgentSessionMeta | null>;
+}
+
 export interface NewAgentSessionEvent {
   ts: number;
   attempt: number;
@@ -417,6 +438,7 @@ export const OWNER_SESSION_EVENT_TYPES = [
   'session_status',
   'session_deleted',
   'session_cancel_requested',
+  'session_title',
 ] as const;
 
 export type OwnerSessionEventType = (typeof OWNER_SESSION_EVENT_TYPES)[number];
@@ -432,7 +454,8 @@ export type NewOwnerSessionEvent =
       status: AgentSessionStatus;
       attempt: number;
     })
-  | (OwnerSessionEventBase & { type: 'session_deleted' | 'session_cancel_requested' });
+  | (OwnerSessionEventBase & { type: 'session_deleted' | 'session_cancel_requested' })
+  | (OwnerSessionEventBase & { type: 'session_title'; title: string | null });
 
 export type PersistedOwnerSessionEvent = NewOwnerSessionEvent & {
   /** Decimal bigint text avoids rounding a replay cursor in JavaScript. */

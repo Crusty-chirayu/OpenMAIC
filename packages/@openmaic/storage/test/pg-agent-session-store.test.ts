@@ -13,7 +13,9 @@ import {
   AgentSessionLeaseLostError,
   AGENT_SESSION_LIFECYCLE,
 } from '../src/agent-session/types.js';
+import type { AgentSessionAutomaticTitleStore, AgentSessionTitleStore } from '../src/index.js';
 import { runAgentSessionConcurrencyContract } from './agent-session-concurrency-contract.js';
+import { runAgentSessionAutomaticTitleContract } from './agent-session-automatic-title-contract.js';
 import { makeAgentSessionInput, runAgentSessionStoreContract } from './agent-session-contract.js';
 import { runAgentSessionUrlContract } from './agent-session-url-contract.js';
 
@@ -40,7 +42,135 @@ describe('PgAgentSessionStore with PGlite', () => {
   runAgentSessionConcurrencyContract('Postgres (PGlite)', () => store, {
     genuineConcurrency: false,
   });
+  runAgentSessionAutomaticTitleContract('Postgres (PGlite)', () => store, {
+    genuineConcurrency: false,
+    writeLegacyManualTitle: (sessionId, ownerId, title) =>
+      db.query(
+        `UPDATE agent_sessions SET title = $3, updated_at = clock_timestamp()
+         WHERE id = $1 AND owner_id = $2`,
+        [sessionId, ownerId, title],
+      ),
+  });
   runAgentSessionUrlContract('Postgres (PGlite)', () => store);
+
+  const textCases = [
+    ['before\u0000after', 'beforeafter'],
+    ['\uD800left\uDC00', '\uFFFDleft\uFFFD'],
+    ['\uD800\u0000\uDC00', '\uFFFD\uFFFD'],
+    ['  课堂 😀 café\nnext  ', '  课堂 😀 café\nnext  '],
+    [String.raw`\u0000 \ud800`, String.raw`\u0000 \ud800`],
+  ];
+
+  test('sanitizes descriptive TEXT when creating a session', async () => {
+    for (const [index, [prompt, expected]] of textCases.entries()) {
+      const id = `text-session-${index}`;
+      const created = await store.createSession(makeAgentSessionInput({ id, prompt }));
+      expect(created.prompt).toBe(expected);
+      expect((await store.getSession(id))?.prompt).toBe(expected);
+      expect(
+        (await store.listSessionsByOwner('owner-a')).find((row) => row.id === id)?.prompt,
+      ).toBe(expected);
+    }
+  });
+
+  test('sanitizes descriptive TEXT in manual titles and their owner projection', async () => {
+    await store.createSession(makeAgentSessionInput({ titleState: 'pending' }));
+    await store.claimAutomaticSessionTitle('session-1', 'owner-a');
+    for (const [title, expected] of textCases) {
+      expect((await store.setManualSessionTitle('session-1', 'owner-a', title))?.title).toBe(
+        expected,
+      );
+      expect((await store.getSession('session-1'))?.title).toBe(expected);
+      expect((await store.readAfter('owner-a', BigInt(0))).at(-1)).toMatchObject({
+        type: 'session_title',
+        title: expected,
+      });
+    }
+    expect(await store.setManualSessionTitle('session-1', 'owner-a', '\u0000')).not.toHaveProperty(
+      'title',
+    );
+    expect((await store.readAfter('owner-a', BigInt(0))).at(-1)).toMatchObject({
+      type: 'session_title',
+      title: null,
+    });
+    expect(await store.setAutomaticSessionTitle('session-1', 'owner-a', 'Late title')).toBeNull();
+  });
+
+  test('sanitizes descriptive TEXT in automatic titles and their owner projection', async () => {
+    for (const [index, [title, expected]] of textCases.entries()) {
+      const id = `text-session-${index}`;
+      await store.createSession(makeAgentSessionInput({ id, titleState: 'pending' }));
+      expect(await store.claimAutomaticSessionTitle(id, 'owner-a')).not.toBeNull();
+      expect((await store.setAutomaticSessionTitle(id, 'owner-a', title))?.title).toBe(expected);
+      expect((await store.getSession(id))?.title).toBe(expected);
+      expect((await store.readAfter('owner-a', BigInt(0))).at(-1)).toMatchObject({
+        type: 'session_title',
+        sessionId: id,
+        title: expected,
+      });
+    }
+  });
+
+  test('sanitizes descriptive TEXT errors without losing failure settlement', async () => {
+    for (const [index, [error, expected]] of textCases.entries()) {
+      const id = `text-session-${index}`;
+      await store.createSession(makeAgentSessionInput({ id }));
+      const claim = await store.claimNextSession('worker-a', 101, {
+        leaseTtlMs: 10_000,
+        maxAttempts: 3,
+        sessionId: id,
+      });
+      expect(claim).not.toBeNull();
+      expect(
+        await store.finishSession(id, 'worker-a', {
+          status: 'failed',
+          error,
+          expectedAttempt: claim!.attempt,
+        }),
+      ).toBe(true);
+      const settled = await store.getSession(id);
+      expect(settled).toMatchObject({ status: 'failed', error: expected });
+      expect(settled).not.toHaveProperty('lease');
+    }
+  });
+
+  test('keeps the automatic title reservation when descriptive TEXT sanitizes to blank', async () => {
+    await store.createSession(makeAgentSessionInput({ titleState: 'pending' }));
+    await store.claimAutomaticSessionTitle('session-1', 'owner-a');
+    const before = await store.readMaxId('owner-a');
+    expect(await store.setAutomaticSessionTitle('session-1', 'owner-a', ' \u0000\n')).toBeNull();
+    expect(await store.readMaxId('owner-a')).toBe(before);
+    expect(
+      (await store.setAutomaticSessionTitle('session-1', 'owner-a', 'Valid title'))?.title,
+    ).toBe('Valid title');
+  });
+
+  test('preserves omitted and empty error semantics after descriptive TEXT sanitization', async () => {
+    await store.createSession(makeAgentSessionInput());
+    await store.claimNextSession('worker-a', 101, { leaseTtlMs: 10_000, maxAttempts: 3 });
+    await store.finishSession('session-1', 'worker-a', {
+      status: 'running',
+      error: 'before\u0000after',
+      releaseLease: false,
+    });
+    expect(
+      await store.finishSession('session-1', 'worker-a', {
+        status: 'running',
+        releaseLease: false,
+      }),
+    ).toBe(true);
+    expect((await store.getSession('session-1'))?.error).toBe('beforeafter');
+    expect(
+      await store.finishSession('session-1', 'worker-a', { status: 'succeeded', error: '\u0000' }),
+    ).toBe(true);
+    expect((await db.query<{ error: string }>('SELECT error FROM agent_sessions')).rows).toEqual([
+      { error: '' },
+    ]);
+    const settled = await store.getSession('session-1');
+    expect(settled).toMatchObject({ status: 'succeeded' });
+    expect(settled).not.toHaveProperty('error');
+    expect(settled).not.toHaveProperty('lease');
+  });
 
   test('provisions all six tables idempotently', async () => {
     await expect(ensureAgentSessionSchema(db)).resolves.toBeUndefined();
@@ -52,6 +182,371 @@ describe('PgAgentSessionStore with PGlite', () => {
     expect(result.rows.map((row) => row.table_name)).toEqual(
       Object.values(DEFAULT_AGENT_SESSION_TABLE_NAMES).sort(),
     );
+  });
+
+  test('does not replace validated title constraints on repeated ensure', async () => {
+    const readConstraints = () =>
+      db.query<{ conname: string; oid: number; convalidated: boolean }>(
+        `SELECT conname, oid, convalidated FROM pg_constraint
+         WHERE conrelid = 'agent_sessions'::regclass
+           AND conname = 'agent_sessions_title_state_known'
+         ORDER BY conname`,
+      );
+    const before = await readConstraints();
+
+    await ensureAgentSessionSchema(db);
+
+    await expect(readConstraints()).resolves.toEqual(before);
+    expect(before.rows).toEqual([
+      expect.objectContaining({
+        conname: 'agent_sessions_title_state_known',
+        convalidated: true,
+      }),
+    ]);
+  });
+
+  test('provisions manual title state with only the three lifecycle values', async () => {
+    const defaults = await db.query<{ column_default: string }>(
+      `SELECT column_default FROM information_schema.columns
+       WHERE table_name = 'agent_sessions' AND column_name = 'title_state'`,
+    );
+    expect(defaults.rows).toEqual([{ column_default: "'manual'::text" }]);
+
+    await expect(
+      db.query(
+        `INSERT INTO agent_sessions (id, owner_id, prompt, stage_id, title_state)
+         VALUES ('state-pending', 'owner-a', 'prompt', 'stage-pending', 'pending'),
+                ('state-automatic', 'owner-a', 'prompt', 'stage-automatic', 'automatic'),
+                ('state-manual', 'owner-a', 'prompt', 'stage-manual', 'manual')`,
+      ),
+    ).resolves.toBeDefined();
+    await expect(
+      db.query(
+        `INSERT INTO agent_sessions (id, owner_id, prompt, stage_id, title_state)
+         VALUES ('state-invalid', 'owner-a', 'prompt', 'stage-invalid', 'retry')`,
+      ),
+    ).rejects.toThrow();
+  });
+
+  test('creates only explicitly requested automatic titles as pending', async () => {
+    await store.createSession(makeAgentSessionInput({ titleState: 'pending' }));
+    await store.createSession(makeAgentSessionInput({ id: 'session-2', stageId: 'stage-2' }));
+
+    const states = await db.query<{ id: string; title_state: string }>(
+      `SELECT id, title_state FROM agent_sessions ORDER BY id`,
+    );
+    expect(states.rows).toEqual([
+      { id: 'session-1', title_state: 'pending' },
+      { id: 'session-2', title_state: 'manual' },
+    ]);
+  });
+
+  test('persists a manual title in session detail and owner lists', async () => {
+    await store.createSession(makeAgentSessionInput());
+    await db.query(`UPDATE agent_sessions SET updated_at = '2000-01-01T00:00:00Z' WHERE id = $1`, [
+      'session-1',
+    ]);
+    const titles: AgentSessionTitleStore = store;
+
+    await expect(
+      titles.setManualSessionTitle('session-1', 'owner-a', 'Focused question'),
+    ).resolves.toMatchObject({
+      id: 'session-1',
+      title: 'Focused question',
+    });
+    const detail = await store.getSession('session-1');
+    expect(detail).toMatchObject({
+      title: 'Focused question',
+      updatedAt: expect.any(Number),
+    });
+    expect(detail!.updatedAt).toBeGreaterThan(new Date('2000-01-01T00:00:00Z').getTime());
+    await expect(store.listSessionsByOwner('owner-a')).resolves.toMatchObject([
+      { id: 'session-1', title: 'Focused question' },
+    ]);
+  });
+
+  test('clears a manual title without emitting a null title field', async () => {
+    await store.createSession(makeAgentSessionInput());
+    const titles: AgentSessionTitleStore = store;
+    await titles.setManualSessionTitle('session-1', 'owner-a', 'Temporary title');
+
+    await expect(titles.setManualSessionTitle('session-1', 'owner-a', null)).resolves.toMatchObject(
+      {
+        id: 'session-1',
+      },
+    );
+    expect(await store.getSession('session-1')).not.toHaveProperty('title');
+    expect((await store.listSessionsByOwner('owner-a'))[0]).not.toHaveProperty('title');
+  });
+
+  test('projects manual title changes, including clear, through owner replay', async () => {
+    await store.createSession(makeAgentSessionInput());
+    const titles: AgentSessionTitleStore = store;
+
+    await titles.setManualSessionTitle('session-1', 'owner-a', 'Focused question');
+    await titles.setManualSessionTitle('session-1', 'owner-a', null);
+
+    await expect(store.readAfter('owner-a', BigInt(1))).resolves.toMatchObject([
+      { type: 'session_title', sessionId: 'session-1', title: 'Focused question' },
+      { type: 'session_title', sessionId: 'session-1', title: null },
+    ]);
+    const stored = await db.query<{ data: unknown }>(
+      `SELECT data FROM agent_owner_session_events
+       WHERE owner_id = 'owner-a' AND type = 'session_title' ORDER BY id`,
+    );
+    expect(stored.rows).toEqual([
+      { data: { title: 'Focused question' } },
+      { data: { title: null } },
+    ]);
+  });
+
+  test('keeps a manual title when its owner projection fails', async () => {
+    const logged: unknown[] = [];
+    const titles = new PgAgentSessionStore(db, {
+      ...optionsFor(db),
+      logger: { error: (...args) => logged.push(args) },
+    });
+    await titles.createSession(makeAgentSessionInput());
+    await db.query(
+      `ALTER TABLE agent_owner_session_events
+       ADD CONSTRAINT reject_title_projection CHECK (type <> 'session_title')`,
+    );
+
+    await expect(
+      titles.setManualSessionTitle('session-1', 'owner-a', 'Still committed'),
+    ).resolves.toMatchObject({ title: 'Still committed' });
+    await expect(titles.getSession('session-1')).resolves.toMatchObject({
+      title: 'Still committed',
+    });
+    expect(await titles.readMaxId('owner-a')).toBe(BigInt(1));
+    expect(logged).toHaveLength(1);
+  });
+
+  test('does not set a title for another owner session', async () => {
+    await store.createSession(makeAgentSessionInput());
+    const titles: AgentSessionTitleStore = store;
+
+    await expect(
+      titles.setManualSessionTitle('session-1', 'owner-b', 'Unauthorized'),
+    ).resolves.toBeNull();
+    expect(await store.getSession('session-1')).not.toHaveProperty('title');
+  });
+
+  test('does not set a title for a soft-deleted session', async () => {
+    await store.createSession(makeAgentSessionInput());
+    const titles: AgentSessionTitleStore = store;
+    await store.softDeleteSession('session-1', 'owner-a');
+
+    await expect(titles.setManualSessionTitle('session-1', 'owner-a', 'Gone')).resolves.toBeNull();
+  });
+
+  test('upgrades an old session schema with existing data intact', async () => {
+    const legacyTables = { sessions: 'legacy_sessions' };
+    await db.query(`
+      CREATE TABLE legacy_sessions (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        stage_id TEXT NOT NULL,
+        active_stage_id TEXT,
+        skill_id TEXT,
+        origin TEXT,
+        existing_course BOOLEAN NOT NULL DEFAULT FALSE,
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempt INTEGER NOT NULL DEFAULT 0,
+        delivered_user_message_seq INTEGER NOT NULL DEFAULT 0,
+        lease_worker_id TEXT,
+        lease_worker_pid INTEGER,
+        lease_heartbeat_at BIGINT,
+        cancel_requested_at BIGINT,
+        error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        deleted_at TIMESTAMPTZ
+      )
+    `);
+    await db.query(
+      `INSERT INTO legacy_sessions (id, owner_id, prompt, stage_id) VALUES ($1, $2, $3, $4)`,
+      ['legacy-1', 'owner-a', 'Existing prompt', 'stage-legacy'],
+    );
+
+    await ensureAgentSessionSchema(db, legacyTables);
+    const legacyStore = new PgAgentSessionStore(db, {
+      ...optionsFor(db),
+      tableNames: legacyTables,
+    });
+
+    const detail = await legacyStore.getSession('legacy-1');
+    expect(detail).toMatchObject({
+      id: 'legacy-1',
+      prompt: 'Existing prompt',
+    });
+    expect(detail).not.toHaveProperty('title');
+    await expect(
+      db.query<{ title_state: string }>(
+        `SELECT title_state FROM legacy_sessions WHERE id = 'legacy-1'`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ title_state: 'manual' }] });
+    await expect(
+      db.query(
+        `INSERT INTO legacy_sessions (id, owner_id, prompt, stage_id, title_state)
+         VALUES ('legacy-invalid', 'owner-a', 'prompt', 'stage-invalid', 'retry')`,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      db.query<{ is_nullable: string }>(
+        `SELECT is_nullable FROM information_schema.columns
+         WHERE table_name = 'legacy_sessions' AND column_name = 'title'`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ is_nullable: 'YES' }] });
+  });
+
+  test('upgrades the closed owner-event constraint for custom table names idempotently', async () => {
+    await db.query(`
+      CREATE TABLE legacy_owner_events (
+        owner_id TEXT NOT NULL,
+        id BIGINT NOT NULL,
+        ts BIGINT NOT NULL,
+        session_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        status TEXT,
+        attempt INTEGER,
+        data JSONB NOT NULL,
+        PRIMARY KEY (owner_id, id),
+        CONSTRAINT legacy_owner_events_type_known CHECK (type IN
+          ('session_created','session_status','session_deleted',
+           'session_active_stage','session_cancel_requested'))
+      )
+    `);
+
+    const legacyTables = { ownerEvents: 'legacy_owner_events' };
+    await expect(ensureAgentSessionSchema(db, legacyTables)).resolves.toBeUndefined();
+    await expect(ensureAgentSessionSchema(db, legacyTables)).resolves.toBeUndefined();
+    const constraints = await db.query<{ conname: string; convalidated: boolean }>(
+      `SELECT conname, convalidated FROM pg_constraint
+       WHERE conrelid = 'legacy_owner_events'::regclass
+         AND conname IN ('legacy_owner_events_type_known'::name,
+                         'agent_owner_session_events_type_known_v2')
+       ORDER BY conname`,
+    );
+    expect(constraints.rows).toEqual([
+      {
+        conname: 'agent_owner_session_events_type_known_v2',
+        convalidated: true,
+      },
+    ]);
+    await expect(
+      db.query(
+        `INSERT INTO legacy_owner_events
+           (owner_id, id, ts, session_id, type, status, attempt, data)
+         VALUES ('owner-a', 1, 1, 'session-1', 'session_title', NULL, NULL,
+                 '{"title":"Migrated"}'::jsonb)`,
+      ),
+    ).resolves.toBeDefined();
+    await expect(
+      db.query(
+        `INSERT INTO legacy_owner_events
+           (owner_id, id, ts, session_id, type, status, attempt, data)
+         VALUES ('owner-a', 2, 1, 'session-1', 'session_retry', NULL, NULL, '{}'::jsonb)`,
+      ),
+    ).rejects.toThrow();
+  });
+
+  test('quotes a reserved custom owner-event table throughout its migration', async () => {
+    await db.query(`
+      CREATE TABLE "user" (
+        owner_id TEXT NOT NULL,
+        id BIGINT NOT NULL,
+        ts BIGINT NOT NULL,
+        session_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        status TEXT,
+        attempt INTEGER,
+        data JSONB NOT NULL,
+        PRIMARY KEY (owner_id, id),
+        CONSTRAINT user_type_known CHECK (type IN
+          ('session_created','session_status','session_deleted',
+           'session_active_stage','session_cancel_requested'))
+      )
+    `);
+
+    const custom = { ownerEvents: 'user', sessions: 'user_sessions' };
+    await expect(ensureAgentSessionSchema(db, custom)).resolves.toBeUndefined();
+    await expect(ensureAgentSessionSchema(db, custom)).resolves.toBeUndefined();
+    await expect(
+      db.query<{ convalidated: boolean }>(
+        `SELECT convalidated FROM pg_constraint
+         WHERE conrelid = '"user"'::regclass
+           AND conname = 'agent_owner_session_events_type_known_v2'`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ convalidated: true }] });
+  });
+
+  test('projects nullable manual and automatic titles through JSON data and replay', async () => {
+    const ownerEvents: Array<{ type: string; title?: string | null }> = [];
+    const hooked = new PgAgentSessionStore(db, {
+      ...optionsFor(db),
+      onOwnerEventAppended: async (_tx, event) => {
+        ownerEvents.push({
+          type: event.type,
+          ...('title' in event ? { title: event.title } : {}),
+        });
+      },
+    });
+    const automatic: AgentSessionAutomaticTitleStore = hooked;
+    const manual: AgentSessionTitleStore = hooked;
+    await hooked.createSession(makeAgentSessionInput({ titleState: 'pending' }));
+    await automatic.claimAutomaticSessionTitle('session-1', 'owner-a');
+    await automatic.setAutomaticSessionTitle('session-1', 'owner-a', 'Generated title');
+    await manual.setManualSessionTitle('session-1', 'owner-a', null);
+
+    expect(ownerEvents).toEqual([
+      { type: 'session_created' },
+      { type: 'session_title', title: 'Generated title' },
+      { type: 'session_title', title: null },
+    ]);
+    await expect(hooked.readAfter('owner-a', BigInt(1))).resolves.toMatchObject([
+      { type: 'session_title', sessionId: 'session-1', title: 'Generated title' },
+      { type: 'session_title', sessionId: 'session-1', title: null },
+    ]);
+    const stored = await db.query<{ data: unknown }>(
+      `SELECT data FROM agent_owner_session_events
+       WHERE owner_id = 'owner-a' AND type = 'session_title' ORDER BY id`,
+    );
+    expect(stored.rows).toEqual([
+      { data: { title: 'Generated title' } },
+      { data: { title: null } },
+    ]);
+  });
+
+  test('keeps manual and automatic title writes when their projections fail', async () => {
+    const logged: unknown[] = [];
+    const titles = new PgAgentSessionStore(db, {
+      ...optionsFor(db),
+      logger: { error: (...args) => logged.push(args) },
+    });
+    await titles.createSession(makeAgentSessionInput({ titleState: 'pending' }));
+    await titles.createSession(
+      makeAgentSessionInput({ id: 'session-2', stageId: 'stage-2', titleState: 'pending' }),
+    );
+    await db.query(
+      `ALTER TABLE agent_owner_session_events
+       ADD CONSTRAINT reject_title_projection CHECK (type <> 'session_title')`,
+    );
+
+    await titles.claimAutomaticSessionTitle('session-1', 'owner-a');
+    await expect(
+      titles.setAutomaticSessionTitle('session-1', 'owner-a', 'Generated title'),
+    ).resolves.toMatchObject({ title: 'Generated title' });
+    await expect(
+      titles.setManualSessionTitle('session-2', 'owner-a', 'Manual title'),
+    ).resolves.toMatchObject({ title: 'Manual title' });
+    await expect(titles.listSessionsByOwner('owner-a')).resolves.toMatchObject([
+      { id: 'session-1', title: 'Generated title' },
+      { id: 'session-2', title: 'Manual title' },
+    ]);
+    expect(await titles.readMaxId('owner-a')).toBe(BigInt(2));
+    expect(logged).toHaveLength(2);
   });
 
   test('requires a correctly pinned transaction hook', () => {
@@ -191,6 +686,95 @@ describe('PgAgentSessionStore with PGlite', () => {
     // returns it verbatim), so getLeafId validates it like any other leaf id
     // and finds no entry with id '' — instead of silently returning null.
     await expect(tree.getLeafId()).rejects.toBeInstanceOf(AgentSessionEntryTreeError);
+  });
+
+  test('persists NUL and lone surrogates in tree entries and events', async () => {
+    await store.createSession(makeAgentSessionInput());
+    await store.claimNextSession('worker-a', 101, { leaseTtlMs: 10_000, maxAttempts: 3 });
+    const tree = await store.openEntryTree('session-1', 'worker-a', 1);
+    const replacement = '\uFFFD';
+    const emoji = '\u{1F600}';
+    const dirty = `a\u0000b\uD800c\uDC00d`;
+
+    await tree.appendEntry({
+      id: 'dirty',
+      parentId: null,
+      type: 'message',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'assistant', content: dirty, [`key\u0000`]: `value\uD800` },
+      emoji,
+    });
+    await store.appendControlEvent('session-1', {
+      ts: 1,
+      type: 'control',
+      data: { text: dirty, emoji },
+    });
+
+    const reopened = await store.openEntryTree('session-1', 'worker-a', 1);
+    const entry = (await reopened.getEntries())[0] as Record<string, unknown>;
+    expect(entry.message).toEqual({
+      role: 'assistant',
+      content: `a${replacement}b${replacement}c${replacement}d`,
+      [`key${replacement}`]: `value${replacement}`,
+    });
+    expect(entry.emoji).toBe(emoji);
+
+    const events = await store.readEventsAfter('session-1', 0);
+    const control = events.find((event) => event.type === 'control');
+    expect(control?.data).toEqual({
+      text: `a${replacement}b${replacement}c${replacement}d`,
+      emoji,
+    });
+  });
+
+  test('keeps colliding sanitized keys as separate tree-entry members', async () => {
+    await store.createSession(makeAgentSessionInput());
+    await store.claimNextSession('worker-a', 101, { leaseTtlMs: 10_000, maxAttempts: 3 });
+    const tree = await store.openEntryTree('session-1', 'worker-a', 1);
+    const replacement = '\uFFFD';
+
+    await tree.appendEntry({
+      id: 'collide',
+      parentId: null,
+      type: 'message',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: {
+        [`a\u0000`]: { first: true },
+        [`a${replacement}`]: { second: true },
+      },
+    });
+
+    const reopened = await store.openEntryTree('session-1', 'worker-a', 1);
+    const entry = (await reopened.getEntries())[0] as Record<string, unknown>;
+    expect(entry.message).toEqual({
+      [`a${replacement}`]: { first: true },
+      [`a${replacement}#2`]: { second: true },
+    });
+  });
+
+  test('keeps an own __proto__ member alongside a NUL key in a tree entry', async () => {
+    await store.createSession(makeAgentSessionInput());
+    await store.claimNextSession('worker-a', 101, { leaseTtlMs: 10_000, maxAttempts: 3 });
+    const tree = await store.openEntryTree('session-1', 'worker-a', 1);
+    const message = JSON.parse(`{"__proto__":{"own":true},"x\\u0000":1}`) as Record<
+      string,
+      unknown
+    >;
+
+    await tree.appendEntry({
+      id: 'proto',
+      parentId: null,
+      type: 'message',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message,
+    });
+
+    const reopened = await store.openEntryTree('session-1', 'worker-a', 1);
+    const entry = (await reopened.getEntries())[0] as Record<string, unknown>;
+    const stored = entry.message as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(stored, '__proto__')).toBe(true);
+    expect(stored['__proto__']).toEqual({ own: true });
+    expect(stored['x\uFFFD']).toBe(1);
   });
 
   test('keeps event and tree rows physically present after a tombstone', async () => {

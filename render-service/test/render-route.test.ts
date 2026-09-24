@@ -10,7 +10,7 @@
  * `unzipProject` stub that parks — recording how many calls are simultaneously
  * "inside" — so we can assert the peak never exceeds the gate's permit count.
  */
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -20,9 +20,11 @@ import type { RenderCoordinatorOptions } from '../src/render-coordinator.js';
 import type { RenderExecutor } from '../src/render-executor.js';
 import { Semaphore } from '../src/semaphore.js';
 import type { RenderJobRecord } from '../src/types.js';
+import { waitUntil } from './support/async.js';
 import {
   createMemoryArtifactStore,
   createMemoryJobStore,
+  parkingExecutor,
   succeedingExecutor,
 } from './support/fakes.js';
 
@@ -85,13 +87,17 @@ async function waitForPoll(
   jobId: string,
   status: RenderJobRecord['status'],
 ): Promise<Record<string, unknown>> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  return waitUntil(async () => {
     const response = await app.fetch(new Request(`http://test/render/${jobId}`));
     const body = (await response.json()) as Record<string, unknown>;
-    if (body.status === status) return body;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error(`Timed out waiting for ${jobId} to reach ${status}`);
+    return body.status === status ? body : null;
+  }, `${jobId} to reach ${status}`);
+}
+
+async function healthBody(app: ReturnType<typeof createApp>): Promise<Record<string, unknown>> {
+  const response = await app.fetch(new Request('http://test/health'));
+  expect(response.status).toBe(200);
+  return (await response.json()) as Record<string, unknown>;
 }
 
 describe('POST /render buffering/extraction bound', () => {
@@ -197,6 +203,43 @@ describe('POST /render buffering/extraction bound', () => {
 });
 
 describe('render HTTP contract through a replaceable executor', () => {
+  it('exposes a safe startup summary without leaking private owner diagnostics', async () => {
+    const jobs = createMemoryJobStore();
+    const now = Date.now();
+    await jobs.create({
+      id: 'startup-failed',
+      status: 'failed',
+      progress: 0,
+      currentStage: 'failed',
+      error: 'Resource render failed; see service logs',
+      createdAtMs: now,
+      updatedAtMs: now,
+      projectDir: '/tmp/startup-failed',
+      resources: {
+        published: false,
+        cleanupVerified: false,
+        reservationReturned: false,
+        admissionClosed: true,
+        diagnosticCode: 'main_pid_read_error',
+        details: { diagnostic: '/proc/42/cgroup: private permission failure' },
+      },
+    });
+    const { app } = testApp(succeedingExecutor, { jobs });
+    const response = await app.fetch(new Request('http://test/render/startup-failed'));
+    const text = await response.text();
+    expect(JSON.parse(text)).toMatchObject({
+      resources: {
+        published: false,
+        cleanupVerified: false,
+        reservationReturned: false,
+        admissionClosed: true,
+        diagnosticCode: 'main_pid_read_error',
+      },
+    });
+    expect(text).not.toContain('/proc/42');
+    expect(text).not.toContain('private permission failure');
+  });
+
   it('preserves submit, polling, and file download behavior', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'render-route-success-'));
     scratch.push(dir);
@@ -340,5 +383,113 @@ describe('render HTTP contract through a replaceable executor', () => {
     const missing = await app.fetch(new Request('http://test/render/missing/download'));
     expect(missing.status).toBe(404);
     await expect(missing.json()).resolves.toEqual({ error: 'Job not found' });
+  });
+});
+
+describe('admission observability (429 reason + /health accepting)', () => {
+  it('keeps /health aggregate-only: exact key set, boolean accepting', async () => {
+    const { app } = testApp(succeedingExecutor);
+    const body = await healthBody(app);
+    // Pinning the exact key set: any new field (queue depths, per-identity
+    // data) must be a deliberate, reviewed change — identity keys are client
+    // IPs behind a trusted proxy, so they must never reach this response.
+    expect(Object.keys(body).sort()).toEqual(['accepting', 'ok', 'resourceProfile', 'versions']);
+    expect(typeof body.accepting).toBe('boolean');
+  });
+
+  it('labels a queue-full 429 with reason and flips /health accepting', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'render-route-queue-full-'));
+    scratch.push(dir);
+    const { executor, releaseRenders } = parkingExecutor();
+    const { app } = testApp(executor, {
+      coordinator: { maxQueue: 1, maxJobsPerUser: 0 },
+      makeProjectDir: async () => dir,
+    });
+
+    // Empty system: health reports we're accepting, aggregates only.
+    await expect(healthBody(app)).resolves.toMatchObject({ ok: true, accepting: true });
+
+    // One admitted render fills the entire global cap and parks there.
+    const first = await app.fetch(renderRequest(4096, 'user-a'));
+    expect(first.status).toBe(202);
+    const { jobId } = (await first.json()) as { jobId: string };
+    await expect(healthBody(app)).resolves.toMatchObject({ accepting: false });
+
+    // A second render from a DIFFERENT identity is still refused — the global
+    // cap fired, not the per-user guard — and the 429 body says so.
+    const second = await app.fetch(renderRequest(4096, 'user-b'));
+    expect(second.status).toBe(429);
+    await expect(second.json()).resolves.toEqual({
+      error: 'The render queue is full; try again shortly.',
+      reason: 'queue_full',
+    });
+
+    // Once the parked render finishes, capacity — and the flag — come back.
+    releaseRenders();
+    await waitForPoll(app, jobId, 'succeeded');
+    await expect(healthBody(app)).resolves.toMatchObject({ accepting: true });
+  });
+
+  it('labels a per-identity 429 with reason (queue itself has room)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'render-route-per-identity-'));
+    scratch.push(dir);
+    const { executor, releaseRenders } = parkingExecutor();
+    const { app } = testApp(executor, {
+      coordinator: { maxQueue: 20, maxJobsPerUser: 1 },
+      makeProjectDir: async () => dir,
+    });
+
+    const first = await app.fetch(renderRequest(4096, 'solo'));
+    expect(first.status).toBe(202);
+    const { jobId } = (await first.json()) as { jobId: string };
+
+    // Same identity again: the system still has queue room (and health stays
+    // accepting) — only this identity's own slot is exhausted.
+    await expect(healthBody(app)).resolves.toMatchObject({ accepting: true });
+    const second = await app.fetch(renderRequest(4096, 'solo'));
+    expect(second.status).toBe(429);
+    await expect(second.json()).resolves.toEqual({
+      error: 'A render is already in progress (limit 1).',
+      reason: 'per_identity_limit',
+    });
+
+    releaseRenders();
+    await waitForPoll(app, jobId, 'succeeded');
+  });
+});
+
+describe('render project CSP hardening', () => {
+  it('injects the render policy into the extracted project before the executor reads it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'render-route-csp-'));
+    scratch.push(dir);
+    let observedHtml: string | undefined;
+    const executor: RenderExecutor = {
+      async execute(request) {
+        observedHtml = await readFile(join(request.projectDir, 'index.html'), 'utf8');
+        return { status: 'succeeded' };
+      },
+    };
+    const jobs = createMemoryJobStore();
+    const artifacts = createMemoryArtifactStore().store;
+    const coordinator = new RenderCoordinator(executor, jobs, artifacts);
+    const app = createApp({
+      jobs,
+      artifacts,
+      coordinator,
+      extractionGate: new Semaphore(1),
+      // The real default `hardenProject` runs here; only extraction is stubbed.
+      unzipProject: async (_zip, destDir) => {
+        await writeFile(join(destDir, 'index.html'), '<!doctype html><html><head></head></html>');
+      },
+      makeProjectDir: async () => dir,
+    });
+
+    const submit = await app.fetch(renderRequest());
+    expect(submit.status).toBe(202);
+    const { jobId } = (await submit.json()) as { jobId: string };
+    await waitForPoll(app, jobId, 'succeeded');
+
+    expect(observedHtml).toContain('data-openmaic-untrusted-csp');
+    expect(observedHtml).toContain("connect-src 'none'");
   });
 });

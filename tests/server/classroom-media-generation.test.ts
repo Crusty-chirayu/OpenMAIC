@@ -108,6 +108,10 @@ describe('generateMediaForClassroom model fallback', () => {
   });
 
   test('gracefully skips media when every configured provider is force-disabled', async () => {
+    // The generic key enables OpenAI's image fallback. This test owns only the
+    // explicitly force-disabled providers below, so keep shell credentials out
+    // of its provider set (and out of fetch-mock failure output).
+    vi.stubEnv('OPENAI_API_KEY', '');
     vi.stubEnv('IMAGE_SEEDREAM_API_KEY', 'sk-seedream');
     vi.stubEnv('IMAGE_SEEDREAM_ENABLED', 'false');
     vi.stubEnv('VIDEO_SEEDANCE_API_KEY', 'sk-seedance');
@@ -214,6 +218,42 @@ describe('generateMediaForClassroom model fallback', () => {
 
     const genBody = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(genBody.model).toBe('pinned-a');
+  });
+
+  test('normalizes GPT Image 2 classroom media to an accepted landscape size', async () => {
+    vi.stubEnv('IMAGE_OPENAI_API_KEY', 'sk-openai');
+    vi.stubEnv('IMAGE_OPENAI_MODELS', 'gpt-image-2');
+    vi.resetModules();
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ data: [{ url: 'https://cdn.example.com/gpt-image-2.png' }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: { get: () => null },
+        arrayBuffer: async () => new ArrayBuffer(8),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { generateMediaForClassroom } = await import('@/lib/server/classroom-media-generation');
+    const outlines = [
+      {
+        id: 'outline_gpt_image_2',
+        type: 'slide',
+        title: 'Scene',
+        description: 'd',
+        order: 1,
+        mediaGenerations: [{ type: 'image', prompt: 'a plant', elementId: 'gen_img_gpt_image_2' }],
+      },
+    ] as unknown as SceneOutline[];
+
+    await generateMediaForClassroom(outlines, 'cls-gpt-image-2', 'http://localhost');
+
+    const genBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(genBody).toMatchObject({ model: 'gpt-image-2', size: '1536x1024' });
   });
 
   test('falls back to the first catalog video model when the server pins no models', async () => {
@@ -328,5 +368,42 @@ describe('generateMediaForClassroom model fallback', () => {
     );
     const genBody = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(genBody.model).toBe('pinned-video-a');
+  });
+
+  test('names Grok inline bytes with the extension for the type it reported', async () => {
+    // xAI answers `b64_json` with JPEG bytes and declares no media type of its
+    // own, so the adapter reports one. Recording it under `.png` — which this
+    // path did for every inline image — serves the file back as the wrong type.
+    // The generic key is cleared for the same reason the first test clears it:
+    // it would otherwise enable OpenAI's image fallback alongside Grok's.
+    vi.stubEnv('OPENAI_API_KEY', '');
+    vi.stubEnv('IMAGE_GROK_API_KEY', 'sk-grok');
+    vi.resetModules();
+
+    const jpegBase64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]).toString('base64');
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ b64_json: jpegBase64 }] }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { generateMediaForClassroom } = await import('@/lib/server/classroom-media-generation');
+
+    const outlines = [
+      {
+        id: 'outline_1',
+        type: 'slide',
+        title: 'Scene 1',
+        description: 'd',
+        order: 1,
+        mediaGenerations: [{ type: 'image', prompt: 'a cat', elementId: 'gen_img_grok' }],
+      },
+    ] as unknown as SceneOutline[];
+
+    const mediaMap = await generateMediaForClassroom(outlines, 'cls-grok', 'http://localhost');
+
+    expect(mediaMap['gen_img_grok']).toBe(
+      'http://localhost/api/classroom-media/cls-grok/media/gen_img_grok.jpg',
+    );
   });
 });

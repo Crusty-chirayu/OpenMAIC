@@ -1,23 +1,36 @@
 // @vitest-environment jsdom
 
-import { act, createElement } from 'react';
+import { act, createElement, createRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   sendMessage: vi.fn(),
+  whiteboardOpen: false,
+  runtimeProjection: null as {
+    stageId: string;
+    lastSeq: number | null;
+    whiteboard: import('@/lib/types/stage').Whiteboard | null;
+  } | null,
   roundtableProps: undefined as Record<string, unknown> | undefined,
   canvasProps: undefined as Record<string, unknown> | undefined,
   piEnabled: true,
+  coursewareReferenceEnabled: true,
   topicActive: false,
   engineMode: 'idle' as 'idle' | 'playing' | 'paused',
   engineOptions: undefined as
     | {
         onModeChange?: (mode: 'idle' | 'playing' | 'paused') => void;
+        onProgress?: (snapshot: { actionIndex: number; sceneId: string }) => void;
         onUserInterrupt?: (text: string) => void;
         onComplete?: () => void;
       }
     | undefined,
+  startLecture: vi.fn(),
+  endSession: vi.fn(),
+  engineStop: vi.fn(),
+  engineStart: vi.fn(),
+  engineContinuePlayback: vi.fn(),
   handleUserInterrupt: vi.fn(),
 }));
 
@@ -64,13 +77,26 @@ const secondScene = {
   title: 'Second slide',
   order: 1,
 };
+const interactiveScene = {
+  id: 'scene-interactive',
+  stageId: 'stage-1',
+  title: 'Projectile simulation',
+  order: 0,
+  type: 'interactive',
+  actions: [],
+  content: {
+    type: 'interactive',
+    widgetType: 'simulation',
+    html: '<label for="angle-slider">Angle</label><input id="angle-slider" type="range" min="0" max="90" value="45">',
+  },
+};
 
 const stageState = {
   mode: 'playback',
-  stage: { id: 'stage-1', whiteboard: [] },
+  stage: { id: 'stage-1', whiteboard: [] as import('@/lib/types/stage').Whiteboard[] },
   getCurrentScene: () =>
     stageState.scenes.find((candidate) => candidate.id === stageState.currentSceneId),
-  scenes: [scene, secondScene],
+  scenes: [scene, secondScene] as Array<typeof scene | typeof interactiveScene>,
   currentSceneId: scene.id,
   setCurrentSceneId: vi.fn((sceneId: string) => {
     stageState.currentSceneId = sceneId;
@@ -93,10 +119,16 @@ vi.mock('@/lib/store', () => {
 vi.mock('@/lib/store/canvas', () => ({
   useCanvasStore: {
     use: {
-      whiteboardOpen: () => false,
+      whiteboardOpen: () => mocks.whiteboardOpen,
+      runtimeWhiteboardProjection: () => mocks.runtimeProjection,
+      whiteboardClearing: () => false,
       setWhiteboardOpenManually: () => vi.fn(),
     },
-    getState: () => ({ whiteboardOpen: false }),
+    getState: () => ({
+      whiteboardOpen: mocks.whiteboardOpen,
+      runtimeWhiteboardProjection: mocks.runtimeProjection,
+      whiteboardClearing: false,
+    }),
   },
 }));
 
@@ -145,6 +177,7 @@ vi.mock('@/lib/hooks/use-i18n', () => ({
         'edit.element.video': 'Video',
         'edit.element.audio': 'Audio',
         'edit.element.code': 'Code',
+        'edit.sceneType.interactive': 'Interactive',
       };
       return summaries[key] ?? key;
     },
@@ -221,8 +254,8 @@ vi.mock('@/components/chat/chat-area', async () => {
       React.useImperativeHandle(ref, () => ({
         sendMessage: mocks.sendMessage,
         endActiveSession: vi.fn().mockResolvedValue(undefined),
-        endSession: vi.fn().mockResolvedValue(undefined),
-        startLecture: vi.fn().mockResolvedValue('lecture-1'),
+        endSession: mocks.endSession,
+        startLecture: mocks.startLecture,
         addLectureMessage: vi.fn(),
         getLectureMessageId: vi.fn(),
         startDiscussion: vi.fn(),
@@ -256,7 +289,9 @@ vi.mock('@/lib/playback', () => ({
       mocks.engineOptions = options;
       options.onModeChange?.(mocks.engineMode);
     }
-    stop() {}
+    stop() {
+      mocks.engineStop();
+    }
     getMode() {
       return mocks.engineMode;
     }
@@ -273,8 +308,12 @@ vi.mock('@/lib/playback', () => ({
       mocks.handleUserInterrupt(text);
       mocks.engineOptions?.onUserInterrupt?.(text);
     }
-    start() {}
-    continuePlayback() {}
+    start() {
+      mocks.engineStart();
+    }
+    continuePlayback() {
+      mocks.engineContinuePlayback();
+    }
     pause() {}
     confirmDiscussion() {}
     skipDiscussion() {}
@@ -326,9 +365,15 @@ vi.mock('@/lib/orchestration/registry/store', () => ({
     { getState: () => ({ getAgent: () => undefined }) },
   ),
 }));
-vi.mock('@/lib/config/feature-flags', () => ({ isPiChatEnabled: () => mocks.piEnabled }));
+vi.mock('@/lib/config/feature-flags', () => ({
+  isPiChatEnabled: () => mocks.piEnabled,
+  isCoursewareReferenceEnabled: () => mocks.coursewareReferenceEnabled,
+}));
 
-import { PlaybackChromeRoot } from '@/components/edit/PlaybackChromeRoot';
+import {
+  PlaybackChromeRoot,
+  type PlaybackChromeRootHandle,
+} from '@/components/edit/PlaybackChromeRoot';
 
 describe('PlaybackChromeRoot element-reference ownership', () => {
   let container: HTMLDivElement;
@@ -336,15 +381,27 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
 
   beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    mocks.whiteboardOpen = false;
+    mocks.runtimeProjection = null;
+    stageState.stage.whiteboard = [];
     mocks.sendMessage.mockReset();
     mocks.sendMessage.mockResolvedValue(undefined);
     mocks.roundtableProps = undefined;
     mocks.canvasProps = undefined;
     mocks.piEnabled = true;
+    mocks.coursewareReferenceEnabled = true;
     mocks.topicActive = false;
     mocks.engineMode = 'idle';
     mocks.engineOptions = undefined;
+    mocks.startLecture.mockReset();
+    mocks.startLecture.mockResolvedValue('lecture-1');
+    mocks.endSession.mockReset();
+    mocks.endSession.mockResolvedValue(undefined);
+    mocks.engineStop.mockReset();
+    mocks.engineStart.mockReset();
+    mocks.engineContinuePlayback.mockReset();
     mocks.handleUserInterrupt.mockReset();
+    stageState.scenes = [scene, secondScene];
     stageState.currentSceneId = scene.id;
     stageState.setCurrentSceneId.mockClear();
     settingsState.autoPlayLecture = false;
@@ -367,9 +424,9 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
     });
   }
 
-  async function renderOwner() {
+  async function renderOwner(props: Record<string, unknown> = {}) {
     await act(async () => {
-      root.render(createElement(PlaybackChromeRoot));
+      root.render(createElement(PlaybackChromeRoot, props));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -382,6 +439,101 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
       await Promise.resolve();
     });
   }
+
+  it('selects the stage snapshot whiteboard and sends an identity-only reference', async () => {
+    const board = {
+      id: 'board',
+      viewportSize: 1000,
+      viewportRatio: 0.5625,
+      elements: [textElement as import('@openmaic/dsl').PPTElement],
+    };
+    mocks.whiteboardOpen = true;
+    stageState.stage.whiteboard = [board];
+    await renderOwner();
+    expect(mocks.roundtableProps?.canPickSlideElement).toBe(true);
+    click('toggle-pick');
+    act(() =>
+      (mocks.canvasProps?.onPickWhiteboardElement as (element: unknown) => void)(textElement),
+    );
+    expect(mocks.canvasProps?.elementPickActive).toBe(false);
+    expect(container.querySelector('[data-testid="owner-pill"]')?.textContent).toContain(
+      'whiteboard.title · Text · First grounded fact',
+    );
+    expect((mocks.roundtableProps?.canSendMessage as () => boolean)()).toBe(true);
+    click('send');
+    expect(mocks.sendMessage.mock.calls[0][1].elementReference).toEqual({
+      kind: 'whiteboard_element',
+      whiteboardId: 'board',
+      elementId: 'text-1',
+    });
+    act(() =>
+      mocks.sendMessage.mock.calls[0][1].onResponseAccepted(
+        new Response('', { headers: { 'X-OpenMAIC-Element-Reference-Accepted': '1' } }),
+      ),
+    );
+    expect(container.querySelector('[data-testid="owner-pill"]')).toBeNull();
+  });
+
+  it.each([false, true])(
+    'disables selection under runtime authority (already armed: %s)',
+    async (alreadyArmed) => {
+      const board = {
+        id: 'board',
+        viewportSize: 1000,
+        viewportRatio: 0.5625,
+        elements: [textElement as import('@openmaic/dsl').PPTElement],
+      };
+      mocks.whiteboardOpen = true;
+      stageState.stage.whiteboard = [board];
+      if (alreadyArmed) {
+        await renderOwner();
+        click('toggle-pick');
+        expect(mocks.canvasProps?.elementPickActive).toBe(true);
+      }
+      mocks.runtimeProjection = { stageId: 'stage-1', lastSeq: 7, whiteboard: board };
+      await renderOwner();
+      expect(mocks.roundtableProps?.canPickSlideElement).toBe(false);
+      click('toggle-pick');
+      expect(mocks.canvasProps?.elementPickActive).toBe(false);
+      act(() =>
+        (mocks.canvasProps?.onPickWhiteboardElement as (element: unknown) => void)(textElement),
+      );
+      expect(container.querySelector('[data-testid="owner-pill"]')).toBeNull();
+    },
+  );
+
+  it('keeps a stale whiteboard selection visible and blocks sending until reselected or removed', async () => {
+    mocks.whiteboardOpen = true;
+    stageState.stage.whiteboard = [
+      {
+        id: 'board',
+        viewportSize: 1000,
+        viewportRatio: 0.5625,
+        elements: [textElement as import('@openmaic/dsl').PPTElement],
+      },
+    ];
+    await renderOwner();
+    click('toggle-pick');
+    act(() =>
+      (mocks.canvasProps?.onPickWhiteboardElement as (element: unknown) => void)(textElement),
+    );
+    stageState.stage.whiteboard[0].elements = [];
+    await rerenderOwner();
+    expect((mocks.roundtableProps?.canSendMessage as () => boolean)()).toBe(false);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="owner-pill"]')).not.toBeNull();
+    act(() => (mocks.roundtableProps?.onClearElementReference as () => void)());
+    expect((mocks.roundtableProps?.canSendMessage as () => boolean)()).toBe(true);
+  });
+
+  it('does not clear a slide draft merely because the whiteboard opens', async () => {
+    await renderOwner();
+    click('toggle-pick');
+    click('pick-text');
+    mocks.whiteboardOpen = true;
+    await rerenderOwner();
+    expect(container.querySelector('[data-testid="owner-pill"]')?.textContent).toContain('Page 1');
+  });
 
   it('owns pick state, freezes one request snapshot, and clears only on an accepted receipt', async () => {
     await renderOwner();
@@ -412,6 +564,32 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
     expect(container.querySelector('[data-testid="owner-pill"]')).toBeNull();
   });
 
+  it('consumes one PPT picker arm synchronously and rejects a stale second pick', async () => {
+    await renderOwner();
+    click('toggle-pick');
+
+    act(() => {
+      const onPickElement = mocks.canvasProps?.onPickElement as (element: unknown) => void;
+      onPickElement(textElement);
+      onPickElement(shapeElement);
+    });
+
+    expect(container.querySelector('[data-testid="owner-pill"]')?.textContent).toContain(
+      'Page 1 · Text · First grounded fact',
+    );
+    click('send');
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      'Explain this',
+      expect.objectContaining({
+        elementReference: {
+          kind: 'slide_element',
+          sceneId: 'scene-1',
+          elementId: 'text-1',
+        },
+      }),
+    );
+  });
+
   it('keeps a newer owner draft when an older request receipt arrives', async () => {
     await renderOwner();
     click('toggle-pick');
@@ -422,6 +600,7 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
       { onResponseAccepted: (response: Response) => void },
     ];
 
+    click('toggle-pick');
     act(() => {
       (mocks.canvasProps?.onPickElement as (element: unknown) => void)(shapeElement);
     });
@@ -481,6 +660,192 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
     expect(mocks.sendMessage).toHaveBeenCalledWith('Explain this', undefined);
   });
 
+  it('keeps Pi messaging available while the independent reference gate clears its UI state', async () => {
+    await renderOwner();
+    click('toggle-pick');
+    click('pick-text');
+    expect(container.querySelector('[data-testid="owner-pill"]')).not.toBeNull();
+
+    mocks.coursewareReferenceEnabled = false;
+    await rerenderOwner();
+
+    expect(mocks.roundtableProps).toMatchObject({
+      showElementReference: false,
+      canPickSlideElement: false,
+      elementPickActive: false,
+    });
+    expect(container.querySelector('[data-testid="toggle-pick"]')).toBeNull();
+    expect(container.querySelector('[data-testid="owner-pill"]')).toBeNull();
+
+    click('send');
+    expect(mocks.sendMessage).toHaveBeenCalledOnce();
+    expect(mocks.sendMessage).toHaveBeenCalledWith('Explain this', undefined);
+  });
+
+  it('owns an Interactive identity delivered through the Stage sibling seam', async () => {
+    stageState.scenes = [interactiveScene];
+    stageState.currentSceneId = interactiveScene.id;
+    const pickerStates: unknown[] = [];
+    const ownerRef = createRef<PlaybackChromeRootHandle>();
+    await renderOwner({
+      ref: ownerRef,
+      onInteractivePickerChange: (state: unknown) => pickerStates.push(state),
+    });
+
+    expect(mocks.roundtableProps).toMatchObject({
+      showElementReference: true,
+      canPickSlideElement: true,
+    });
+    click('toggle-pick');
+    expect(pickerStates).toContainEqual({
+      sceneId: interactiveScene.id,
+      active: true,
+      selectedSelector: undefined,
+    });
+
+    act(() => {
+      expect(
+        ownerRef.current?.acceptInteractivePick({
+          sceneId: interactiveScene.id,
+          selector: '#angle-slider',
+        }),
+      ).toBe(true);
+      expect(
+        ownerRef.current?.acceptInteractivePick({
+          sceneId: interactiveScene.id,
+          selector: '#stale-second-pick',
+        }),
+      ).toBe(false);
+    });
+    expect(container.querySelector('[data-testid="owner-pill"]')?.textContent).toContain(
+      'Page 1 · Interactive · #angle-slider',
+    );
+    expect(pickerStates).toContainEqual({
+      sceneId: interactiveScene.id,
+      active: false,
+      selectedSelector: '#angle-slider',
+    });
+
+    click('send');
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      'Explain this',
+      expect.objectContaining({
+        elementReference: {
+          kind: 'interactive_component',
+          sceneId: interactiveScene.id,
+          selector: '#angle-slider',
+        },
+      }),
+    );
+    const [, options] = mocks.sendMessage.mock.calls[0] as [
+      string,
+      { onResponseAccepted: (response: Response) => void },
+    ];
+    act(() =>
+      options.onResponseAccepted(
+        new Response(null, { headers: { 'X-OpenMAIC-Element-Reference-Accepted': '1' } }),
+      ),
+    );
+    expect(pickerStates.at(-1)).toEqual({
+      sceneId: interactiveScene.id,
+      active: false,
+      selectedSelector: undefined,
+    });
+  });
+
+  it('rejects an Interactive pick synchronously after the owner cancels', async () => {
+    stageState.scenes = [interactiveScene];
+    stageState.currentSceneId = interactiveScene.id;
+    const ownerRef = createRef<PlaybackChromeRootHandle>();
+    await renderOwner({ ref: ownerRef });
+
+    click('toggle-pick');
+    act(() => {
+      ownerRef.current?.cancelElementPick();
+      expect(
+        ownerRef.current?.acceptInteractivePick({
+          sceneId: interactiveScene.id,
+          selector: '#stale-after-cancel',
+        }),
+      ).toBe(false);
+    });
+
+    expect(container.querySelector('[data-testid="owner-pill"]')).toBeNull();
+  });
+
+  it('cancels an armed Interactive picker with Escape from playback chrome', async () => {
+    stageState.scenes = [interactiveScene];
+    stageState.currentSceneId = interactiveScene.id;
+    const pickerStates: unknown[] = [];
+    const ownerRef = createRef<PlaybackChromeRootHandle>();
+    await renderOwner({
+      ref: ownerRef,
+      onInteractivePickerChange: (state: unknown) => pickerStates.push(state),
+    });
+
+    click('toggle-pick');
+    expect(pickerStates.at(-1)).toEqual({
+      sceneId: interactiveScene.id,
+      active: true,
+      selectedSelector: undefined,
+    });
+
+    const escape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => window.dispatchEvent(escape));
+
+    expect(escape.defaultPrevented).toBe(true);
+    expect(pickerStates.at(-1)).toEqual({
+      sceneId: interactiveScene.id,
+      active: false,
+      selectedSelector: undefined,
+    });
+    expect(
+      ownerRef.current?.acceptInteractivePick({
+        sceneId: interactiveScene.id,
+        selector: '#stale-after-escape',
+      }),
+    ).toBe(false);
+  });
+
+  it('freezes one Interactive identity for exactly one send and preserves it without a receipt', async () => {
+    stageState.scenes = [interactiveScene];
+    stageState.currentSceneId = interactiveScene.id;
+    const ownerRef = createRef<PlaybackChromeRootHandle>();
+    await renderOwner({ ref: ownerRef });
+
+    click('toggle-pick');
+    act(() => {
+      ownerRef.current?.acceptInteractivePick({
+        sceneId: interactiveScene.id,
+        selector: '#angle-slider',
+      });
+    });
+    click('send');
+
+    expect(mocks.handleUserInterrupt).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledOnce();
+    const [, options] = mocks.sendMessage.mock.calls[0] as [
+      string,
+      {
+        elementReference: unknown;
+        onResponseAccepted: (response: Response) => void;
+      },
+    ];
+    expect(options.elementReference).toEqual({
+      kind: 'interactive_component',
+      sceneId: interactiveScene.id,
+      selector: '#angle-slider',
+    });
+    act(() => options.onResponseAccepted(new Response(null)));
+    expect(container.querySelector('[data-testid="owner-pill"]')?.textContent).toContain(
+      '#angle-slider',
+    );
+  });
+
   it('clears the owner draft after manual scene navigation settles', async () => {
     await renderOwner();
     click('toggle-pick');
@@ -515,6 +880,81 @@ describe('PlaybackChromeRoot element-reference ownership', () => {
 
     expect(stageState.setCurrentSceneId).not.toHaveBeenCalled();
     expect(container.querySelector('[data-testid="owner-pill"]')).not.toBeNull();
+  });
+
+  it('stops the previous engine when switching to a non-playable scene', async () => {
+    await renderOwner();
+    expect(mocks.engineStop).not.toHaveBeenCalled();
+    const previousEngineOptions = mocks.engineOptions;
+
+    stageState.scenes = [scene, interactiveScene];
+    stageState.currentSceneId = interactiveScene.id;
+    await rerenderOwner();
+
+    expect(mocks.engineStop).toHaveBeenCalledOnce();
+    act(() => previousEngineOptions?.onProgress?.({ actionIndex: 1, sceneId: scene.id }));
+    expect(mocks.roundtableProps?.currentActionIndex).toBe(0);
+  });
+
+  it('does not resume manual playback after its engine is superseded', async () => {
+    let resolveStartLecture!: (sessionId: string) => void;
+    mocks.startLecture.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveStartLecture = resolve;
+      }),
+    );
+    await renderOwner();
+    const onPlayPause = mocks.roundtableProps?.onPlayPause as () => Promise<void>;
+
+    let playPromise!: Promise<void>;
+    act(() => {
+      playPromise = onPlayPause();
+    });
+    stageState.scenes = [scene, interactiveScene];
+    stageState.currentSceneId = interactiveScene.id;
+    await rerenderOwner();
+
+    await act(async () => {
+      resolveStartLecture('stale-lecture');
+      await playPromise;
+    });
+
+    expect(mocks.engineContinuePlayback).not.toHaveBeenCalled();
+    expect(mocks.endSession).toHaveBeenCalledWith('stale-lecture');
+  });
+
+  it('does not auto-start playback after its engine is superseded', async () => {
+    vi.useFakeTimers();
+    settingsState.autoPlayLecture = true;
+    try {
+      await renderOwner();
+      act(() => mocks.engineOptions?.onComplete?.());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+
+      let resolveStartLecture!: (sessionId: string) => void;
+      mocks.startLecture.mockReturnValueOnce(
+        new Promise<string>((resolve) => {
+          resolveStartLecture = resolve;
+        }),
+      );
+      await rerenderOwner();
+
+      stageState.scenes = [scene, secondScene, interactiveScene];
+      stageState.currentSceneId = interactiveScene.id;
+      await rerenderOwner();
+
+      await act(async () => {
+        resolveStartLecture('stale-auto-lecture');
+        await Promise.resolve();
+      });
+
+      expect(mocks.engineStart).not.toHaveBeenCalled();
+      expect(mocks.endSession).toHaveBeenCalledWith('stale-auto-lecture');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clears the owner draft after automatic playback advances the scene', async () => {

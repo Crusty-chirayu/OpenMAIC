@@ -73,6 +73,8 @@ describe('model-routes', () => {
     const { getStageModel } = await import('@/lib/server/model-routes');
     expect(getStageModel('scene-content')).toBeUndefined();
     expect(error).toHaveBeenCalled();
+    expect(error.mock.calls[0]?.[0]).toContain('callers apply their own fallback');
+    expect(error.mock.calls[0]?.[0]).not.toContain('DEFAULT_MODEL');
   });
 
   it('ignores non-string route values', async () => {
@@ -376,7 +378,50 @@ describe('model-routes', () => {
         'web-search-query-rewrite',
         'maic-agent',
         'maic-agent-driver',
+        'conversation-title',
       ]),
     );
+  });
+
+  it('parses known user stages from x-model-routes and drops unknown ones', async () => {
+    const { parseUserStageRoutes } = await import('@/lib/server/model-routes');
+    const routes = parseUserStageRoutes(
+      JSON.stringify({
+        'chat-adapter': 'minimax:MiniMax-M3',
+        'quiz-grade': {
+          model: 'anthropic:claude-sonnet-4',
+          apiKey: 'user-key',
+          baseUrl: 'https://user.example/v1',
+          providerType: 'anthropic',
+        },
+        'not-a-stage': 'openai:gpt-5.4',
+      }),
+    );
+    expect(routes['chat-adapter']).toEqual({ model: 'minimax:MiniMax-M3' });
+    expect(routes['quiz-grade']).toEqual({
+      model: 'anthropic:claude-sonnet-4',
+      apiKey: 'user-key',
+      baseUrl: 'https://user.example/v1',
+      providerType: 'anthropic',
+    });
+    expect(routes).not.toHaveProperty('not-a-stage');
+  });
+
+  it('returns no user routes for malformed, empty, or oversized headers', async () => {
+    const { parseUserStageRoutes } = await import('@/lib/server/model-routes');
+    expect(parseUserStageRoutes(undefined)).toEqual({});
+    expect(parseUserStageRoutes(null)).toEqual({});
+    expect(parseUserStageRoutes('not json')).toEqual({});
+    expect(parseUserStageRoutes('[]')).toEqual({});
+    expect(parseUserStageRoutes('x'.repeat(17 * 1024))).toEqual({});
+  });
+
+  it('resolves a composite user route from its parent key', async () => {
+    const { getUserStageRoute } = await import('@/lib/server/model-routes');
+    const routes = { 'pbl-v2-runtime': { model: 'anthropic:claude-sonnet-4' } };
+    expect(getUserStageRoute(routes, 'pbl-v2-runtime:instructor')).toEqual({
+      model: 'anthropic:claude-sonnet-4',
+    });
+    expect(getUserStageRoute(routes, 'chat-adapter')).toBeUndefined();
   });
 });

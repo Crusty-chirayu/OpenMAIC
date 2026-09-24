@@ -12,6 +12,7 @@ import {
   commitSessionRename,
   isDerivedSessionTitle,
   normalizeSessionTitleInput,
+  normalizeSessionTitleOverride,
   SESSION_TITLE_MAX_LENGTH,
   workbenchSessionTitle,
 } from '@/lib/workbench/session-title';
@@ -47,6 +48,16 @@ describe('what a rename sends', () => {
     );
   });
 
+  it('uses the input maxLength budget without splitting a surrogate pair', () => {
+    expect(normalizeSessionTitleOverride(`${'x'.repeat(118)}😀`)).toBe(`${'x'.repeat(118)}😀`);
+    expect(normalizeSessionTitleOverride(`${'x'.repeat(119)}😀tail`)).toBe('x'.repeat(119));
+  });
+
+  it('makes PostgreSQL-invalid API text safe for storage and projection', () => {
+    expect(normalizeSessionTitleOverride(`Safe\ud83d title`)).toBe('Safe� title');
+    expect(normalizeSessionTitleOverride(`Safe\u0000 title`)).toBe('Safe� title');
+  });
+
   it('reads an empty box as "clear the name", not as a blank title', () => {
     expect(normalizeSessionTitleInput(session, '')).toBeNull();
     expect(normalizeSessionTitleInput(session, '   ')).toBeNull();
@@ -63,32 +74,65 @@ describe('committing a rename', () => {
   const session = { title: null, prompt: '帮我做一节课' };
 
   it('writes it locally first, then settles on what the server stored', async () => {
-    const applied: (string | null)[] = [];
+    const applied: { title: string | null; settled: boolean }[] = [];
     const save = vi.fn(async () => '期末复习');
     const outcome = await commitSessionRename({
       current: session,
       raw: '期末复习课',
-      apply: (title) => applied.push(title),
+      apply: (title, settled) => applied.push({ title, settled }),
       save,
     });
     expect(outcome).toBe('renamed');
     expect(save).toHaveBeenCalledWith('期末复习课');
     // Optimistic value, then the server's — which can differ (it caps).
-    expect(applied).toEqual(['期末复习课', '期末复习']);
+    expect(applied).toEqual([
+      { title: '期末复习课', settled: false },
+      { title: '期末复习', settled: true },
+    ]);
   });
 
   it('puts the old name back when the write is refused', async () => {
-    const applied: (string | null)[] = [];
+    const applied: { title: string | null; settled: boolean }[] = [];
     const outcome = await commitSessionRename({
       current: { title: '旧名字', prompt: '帮我做一节课' },
       raw: '新名字',
-      apply: (title) => applied.push(title),
+      apply: (title, settled) => applied.push({ title, settled }),
       save: async () => {
         throw new Error('500');
       },
     });
     expect(outcome).toBe('failed');
-    expect(applied).toEqual(['新名字', '旧名字']);
+    expect(applied).toEqual([
+      { title: '新名字', settled: false },
+      { title: '旧名字', settled: true },
+    ]);
+  });
+
+  it.each([
+    { settlement: 'success', save: async () => '服务端名字', outcome: 'renamed' },
+    {
+      settlement: 'failure',
+      save: async () => {
+        throw new Error('500');
+      },
+      outcome: 'failed',
+    },
+  ])('does not apply a stale $settlement settlement', async ({ save, outcome: expected }) => {
+    const applied: (string | null)[] = [];
+    let current = true;
+    const outcome = await commitSessionRename({
+      current: { title: '旧名字', prompt: '帮我做一节课' },
+      raw: '本地名字',
+      apply: (title) => {
+        applied.push(title);
+        current = false;
+      },
+      save,
+      isCurrent: () => current,
+    });
+
+    expect(outcome).toBe(expected);
+    expect(applied).toEqual(['本地名字']);
   });
 
   it('clears the override on an empty box, so the derived title comes back', async () => {
@@ -105,6 +149,22 @@ describe('committing a rename', () => {
     expect(applied).toEqual([null, null]);
   });
 
+  it.each([
+    ['an empty input', '  '],
+    ['the unchanged prompt fallback', ' 帮我做一节课 '],
+  ])('does not turn %s into a manual clear when no override exists', async (_case, raw) => {
+    const save = vi.fn(async () => null);
+    const outcome = await commitSessionRename({
+      current: session,
+      raw,
+      apply: () => expect.unreachable('nothing should be written'),
+      save,
+    });
+
+    expect(outcome).toBe('unchanged');
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it('spends no round trip when nothing changed', async () => {
     const save = vi.fn(async () => null);
     const outcome = await commitSessionRename({
@@ -115,6 +175,22 @@ describe('committing a rename', () => {
     });
     expect(outcome).toBe('unchanged');
     expect(save).not.toHaveBeenCalled();
+  });
+
+  it('preserves an explicit same-value decision queued behind an ambiguous write', async () => {
+    const applied: (string | null)[] = [];
+    const save = vi.fn(async () => '旧名字');
+    const outcome = await commitSessionRename({
+      current: { title: '旧名字', prompt: '帮我做一节课' },
+      raw: '旧名字',
+      apply: (title) => applied.push(title),
+      save,
+      forceSave: true,
+    });
+
+    expect(outcome).toBe('renamed');
+    expect(save).toHaveBeenCalledWith('旧名字');
+    expect(applied).toEqual(['旧名字', '旧名字']);
   });
 });
 

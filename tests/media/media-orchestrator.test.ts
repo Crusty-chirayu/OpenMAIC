@@ -1,11 +1,19 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   settings: vi.fn(),
   mediaPut: vi.fn(),
   mediaDelete: vi.fn(),
+  putAsset: vi.fn(),
+  persistReference: vi.fn(),
+}));
+
+vi.mock('@/lib/media/asset-pool', () => ({
+  putAsset: mocks.putAsset,
+}));
+
+vi.mock('@/lib/media/persist-media-reference', () => ({
+  persistGeneratedMediaReference: mocks.persistReference,
 }));
 
 vi.mock('@/lib/store/settings', () => ({
@@ -70,6 +78,8 @@ describe('classic media orchestrator', () => {
     resetProxyMediaFailureCache();
     mocks.mediaPut.mockReset().mockResolvedValue(undefined);
     mocks.mediaDelete.mockReset().mockResolvedValue(undefined);
+    mocks.putAsset.mockReset().mockResolvedValue('ast_unexpected');
+    mocks.persistReference.mockReset().mockResolvedValue('written');
     mocks.settings.mockReset().mockReturnValue({
       imageGenerationEnabled: true,
       videoGenerationEnabled: true,
@@ -169,6 +179,44 @@ describe('classic media orchestrator', () => {
       status: 'done',
       objectUrl: 'blob:classic-1',
     });
+  });
+
+  it('records the type an inline data URL declares, rather than assuming PNG', async () => {
+    // A provider that answers inline states its type in the data URL the
+    // adapter builds (`grok-image-adapter` does this for xAI's JPEG bytes). The
+    // row keeps that type, so the bytes are not stored — and later served — as
+    // a PNG they are not. The stub derives the response type from the URL, the
+    // way fetching a data URL does, so a URL that claimed PNG would fail here.
+    const jpegBase64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]).toString('base64');
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const request = String(input);
+      if (request === '/api/generate/image') {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            result: { url: `data:image/jpeg;base64,${jpegBase64}` },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (request.startsWith('data:')) {
+        return new Response(Buffer.from(jpegBase64, 'base64'), {
+          status: 200,
+          headers: { 'content-type': request.slice('data:'.length).split(';')[0] },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${request}`);
+    });
+
+    await generateMediaForOutlines(
+      [outlineWith({ type: 'image', prompt: 'A diagram', elementId: imageRef })],
+      stageId,
+    );
+
+    expect(mocks.mediaPut).toHaveBeenCalledTimes(1);
+    const row = mocks.mediaPut.mock.calls[0]![0] as { blob: Blob; mimeType: string };
+    expect(row.mimeType).toBe('image/jpeg');
+    expect(row.blob.type).toBe('image/jpeg');
   });
 
   it('stores video and poster bytes in one placeholder-keyed classic row', async () => {
@@ -344,13 +392,25 @@ describe('classic media orchestrator', () => {
     expect(mocks.mediaPut).not.toHaveBeenCalled();
   });
 
-  it('does not import the asset pool or document mutation seams', () => {
-    const source = readFileSync(join(process.cwd(), 'lib/media/media-orchestrator.ts'), 'utf8');
-    expect(source).not.toMatch(/from ['"]@\/lib\/media\/asset-pool['"]/);
-    expect(source).not.toContain('putAsset(');
-    expect(source).not.toContain('replaceAsset(');
-    expect(source).not.toContain('mutateDocument(');
-    expect(source).not.toContain('.rekeyDone(');
+  // Browser-only mode is the default here: no persistence flag is stubbed, so
+  // the asset-pool seam is unconfigured and every case above ran through the
+  // local table. Nothing may have touched the pool or the document.
+  it('never reaches the asset pool or the document write-back in browser-only mode', async () => {
+    serveImage();
+    await generateMediaForOutlines(
+      [outlineWith({ type: 'image', prompt: 'A diagram', elementId: imageRef })],
+      stageId,
+    );
+    serveVideo();
+    await generateMediaForOutlines(
+      [outlineWith({ type: 'video', prompt: 'A clip', elementId: videoRef })],
+      stageId,
+    );
+
+    expect(useMediaGenerationStore.getState().tasks[imageRef]?.status).toBe('done');
+    expect(useMediaGenerationStore.getState().tasks[videoRef]?.status).toBe('done');
+    expect(mocks.putAsset).not.toHaveBeenCalled();
+    expect(mocks.persistReference).not.toHaveBeenCalled();
   });
 
   it('retains renderer retry targeting as a read-side compatibility seam', () => {

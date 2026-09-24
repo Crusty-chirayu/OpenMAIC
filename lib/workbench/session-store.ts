@@ -23,10 +23,15 @@
  */
 import { create } from 'zustand';
 import { isSkillLoadTool, skillLoadId } from './skill-load';
-import { defaultWorkbenchTranslator, type WorkbenchCopyKey } from '@/lib/i18n/workbench';
+import {
+  defaultWorkbenchTranslator,
+  type WorkbenchCopyKey,
+  type WorkbenchTranslator,
+} from '@/lib/i18n/workbench';
 import { parseElementRefs, type ElementRef } from './element-refs';
 import { parseCourseRefs, type CourseRef } from './course-refs';
 import { appendCourseSighting, courseSightingsOf } from './run-courses';
+import { resolveWorkbenchMaterialMime } from './material-upload-policy';
 
 export type ChatNodeKind =
   | 'user'
@@ -256,10 +261,9 @@ export interface WorkbenchFold {
    * something better, including the queued window before `session_start`. */
   sessionPrompt: string | null;
   /**
-   * The name the user gave this conversation, if any. An OVERRIDE over the
-   * derived title, not a replacement for the prompt — clearing it restores the
-   * derived one. Like `sessionPrompt` it comes from session meta rather than
-   * from the event log: a rename is not something the run did.
+   * The stored automatic or manual title, if any. It overrides the derived
+   * title, not the prompt — clearing it restores the derived one. Like
+   * `sessionPrompt`, it is session metadata rather than Agent transcript data.
    */
   sessionTitle: string | null;
   skillId: string | null;
@@ -398,6 +402,12 @@ export interface WorkbenchFold {
 export interface WorkbenchSessionState extends WorkbenchFold {
   sessionId: string | null;
   attached: boolean;
+  /**
+   * Changes whenever this client makes a title decision. A detail request
+   * captures it so an older response cannot overwrite a rename (including an
+   * explicit clear) made while that request was in flight.
+   */
+  sessionTitleRevision: number;
   /** True until the replayed backlog is exhausted; the UI says "catching up". */
   replaying: boolean;
   /**
@@ -448,13 +458,14 @@ export interface WorkbenchState extends WorkbenchSessionState {
   setSessionPrompt: (prompt: string | null) => void;
   /**
    * The rename's optimistic write, and its rollback: the caller sets the new
-   * title, POSTs, and puts the old one back if the write is refused.
+   * title, PATCHes, and puts the old one back if the write is refused.
    */
   setSessionTitle: (title: string | null) => void;
   /** Seed title / stage / idle status from session meta before any events arrive. */
   setSessionBootstrap: (input: {
     prompt?: string | null;
     title?: string | null;
+    expectedTitleRevision?: number;
     status?: SessionStatus;
     stageId?: string | null;
   }) => void;
@@ -506,6 +517,7 @@ export function createInitialSessionState(): WorkbenchSessionState {
     // ── Attachment ──────────────────────────────────────────────────────
     sessionId: null,
     attached: false,
+    sessionTitleRevision: 0,
     // Nothing is attached, so there is nothing to replay. It used to be `true`
     // here, which is only ever read as "keep the catch-up spinner up" — and with
     // no session nothing would ever turn it off again (the stream hook returns
@@ -1870,11 +1882,19 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
     })),
   setError: (error) => set({ error }),
   setSessionPrompt: (sessionPrompt) => set({ sessionPrompt }),
-  setSessionTitle: (sessionTitle) => set({ sessionTitle }),
+  setSessionTitle: (sessionTitle) =>
+    set((state) => ({
+      sessionTitle,
+      sessionTitleRevision: state.sessionTitleRevision + 1,
+    })),
   setSessionBootstrap: (input) =>
     set((state) => ({
       ...(input.prompt !== undefined ? { sessionPrompt: input.prompt } : {}),
-      ...(input.title !== undefined ? { sessionTitle: input.title } : {}),
+      ...(input.title !== undefined &&
+      (input.expectedTitleRevision === undefined ||
+        input.expectedTitleRevision === state.sessionTitleRevision)
+        ? { sessionTitle: input.title }
+        : {}),
       ...(input.status && state.lastEventId === 0 ? { status: input.status } : {}),
       // Only ever FILLS the stage, never overwrites: the attach path knows it
       // first-hand when it has it, and a late meta response for a session the
@@ -2106,23 +2126,67 @@ export interface WorkbenchMaterial {
   extractionStatus?: 'idle' | 'pending' | 'running' | 'done' | 'failed';
 }
 
+/**
+ * Display mebibytes for a byte cap. One fractional digit, rounded down, with
+ * the caller's decimal separator. A positive cap below 0.1 MiB, or a runtime
+ * that will not floor, returns undefined so the caller can use the generic
+ * message instead of showing 0 or an overstated limit.
+ */
+function formatMaterialUploadLimit(
+  maxBytes: number | undefined,
+  locale: string,
+): string | undefined {
+  if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes <= 0) return undefined;
+  const limit = maxBytes / (1024 * 1024);
+  if (limit < 0.1) return undefined;
+  try {
+    const formatter = new Intl.NumberFormat(locale, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 1,
+      roundingMode: 'floor',
+      useGrouping: false,
+      numberingSystem: 'latn',
+    });
+    if (formatter.resolvedOptions().roundingMode !== 'floor') return undefined;
+    return formatter.format(limit);
+  } catch {
+    return undefined;
+  }
+}
+
 export class WorkbenchMaterialUploadError extends Error {
   constructor(
     message: string,
     readonly status: number,
     readonly requestId?: string,
+    readonly maxBytes?: number,
   ) {
     super(message);
     this.name = 'WorkbenchMaterialUploadError';
+  }
+
+  userMessage(t: WorkbenchTranslator, locale: string): string {
+    if (this.status !== 413) return this.message;
+    const limit = formatMaterialUploadLimit(this.maxBytes, locale);
+    return limit === undefined
+      ? t('workbench.material.fileTooLarge')
+      : t('workbench.material.fileTooLargeWithLimit', { limit });
   }
 }
 
 /** Upload one file into the caller's durable material library. */
 export async function uploadWorkbenchMaterial(file: File): Promise<WorkbenchMaterial> {
+  // Some Linux browsers report every OOXML file with the generic
+  // `application/vnd.ms-office` MIME (#1497) — resolve the concrete type
+  // from the filename so the server gate sees what the file actually is.
+  const mimeType = resolveWorkbenchMaterialMime({
+    mimeType: file.type,
+    fileName: file.name,
+  });
   const res = await fetch('/api/materials', {
     method: 'POST',
     headers: {
-      'content-type': file.type || 'application/octet-stream',
+      'content-type': mimeType || 'application/octet-stream',
       'x-material-filename': encodeURIComponent(file.name),
     },
     body: file,
@@ -2137,6 +2201,7 @@ export async function uploadWorkbenchMaterial(file: File): Promise<WorkbenchMate
     extraction?: { status?: WorkbenchMaterial['extractionStatus'] };
     error?: string;
     message?: string;
+    maxBytes?: unknown;
   };
   if (!res.ok || !body.materialId) {
     const requestId = res.headers.get('x-request-id') ?? undefined;
@@ -2145,13 +2210,19 @@ export async function uploadWorkbenchMaterial(file: File): Promise<WorkbenchMate
       requestId ? `${message} [requestId=${requestId}]` : message,
       res.status,
       requestId,
+      typeof body.maxBytes === 'number' && Number.isFinite(body.maxBytes) && body.maxBytes > 0
+        ? body.maxBytes
+        : undefined,
     );
   }
+  // Prefer the server's echo; fall back to the locally resolved MIME (never
+  // the raw browser value, which may be the generic Office container).
+  const recordMime = body.mime || mimeType || file.type;
   return {
     materialId: body.materialId,
     name: body.originalName ?? file.name,
     bytes: body.bytes ?? file.size,
-    ...(body.mime || file.type ? { mimeType: body.mime || file.type } : {}),
+    ...(recordMime ? { mimeType: recordMime } : {}),
     ...(body.extraction?.status ? { extractionStatus: body.extraction.status } : {}),
   };
 }

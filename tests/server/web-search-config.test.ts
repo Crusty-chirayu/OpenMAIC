@@ -6,6 +6,8 @@ describe('server web search config', () => {
     vi.unstubAllEnvs();
     delete process.env.TAVILY_API_KEY;
     delete process.env.TAVILY_BASE_URL;
+    delete process.env.EXA_API_KEY;
+    delete process.env.EXA_BASE_URL;
     delete process.env.BOCHA_API_KEY;
     delete process.env.BOCHA_BASE_URL;
     delete process.env.BRAVE_API_KEY;
@@ -34,6 +36,59 @@ describe('server web search config', () => {
     expect(resolveSafeClientWebSearchBaseUrl('bocha', 'https://api.bochaai.com/v1')).toBe(
       'https://api.bochaai.com/v1',
     );
+  });
+
+  it('allows the web-search base URL every built-in token plan writes to client settings', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+    const { TOKEN_PLAN_PRESETS } = await import('@/lib/config/token-plan-presets');
+    const targets = TOKEN_PLAN_PRESETS.flatMap((preset) =>
+      preset.modalities.webSearch ? [preset.modalities.webSearch] : [],
+    );
+
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) {
+      expect(
+        resolveSafeClientWebSearchBaseUrl(
+          target.providerId as Parameters<typeof resolveSafeClientWebSearchBaseUrl>[0],
+          target.baseUrl,
+        ),
+      ).toBe(target.baseUrl.replace(/\/+$/, ''));
+    }
+    expect(() =>
+      resolveSafeClientWebSearchBaseUrl('bocha', 'https://tokendance.space/gateway/other'),
+    ).toThrow('Unsupported Bocha base URL');
+  });
+
+  it('allows official Exa client base URLs and resolves client credentials', async () => {
+    const { resolveClassroomWebSearchConfig, resolveSafeClientWebSearchBaseUrl } =
+      await import('@/lib/server/web-search-config');
+
+    expect(resolveSafeClientWebSearchBaseUrl('exa', 'https://api.exa.ai/search')).toBe(
+      'https://api.exa.ai/search',
+    );
+    expect(
+      resolveClassroomWebSearchConfig({
+        webSearchProviderId: 'exa',
+        webSearchApiKey: 'exa-client-key',
+        webSearchBaseUrl: 'https://api.exa.ai',
+      }),
+    ).toEqual({
+      providerId: 'exa',
+      apiKey: 'exa-client-key',
+      baseUrl: 'https://api.exa.ai',
+    });
+  });
+
+  it('resolves Exa classroom config from server environment variables', async () => {
+    vi.stubEnv('EXA_API_KEY', 'exa-server-key');
+    vi.stubEnv('EXA_BASE_URL', 'https://proxy.example.com/exa');
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(resolveClassroomWebSearchConfig({ webSearchProviderId: 'exa' })).toEqual({
+      providerId: 'exa',
+      apiKey: 'exa-server-key',
+      baseUrl: 'https://proxy.example.com/exa',
+    });
   });
 
   it('allows official MiniMax client base URLs', async () => {

@@ -80,6 +80,8 @@ export const workbenchEn = {
     remove: 'Remove {{name}}',
     removeFailed: 'Remove failed upload',
     uploadFailed: 'Could not upload {{name}}. Please try again.',
+    fileTooLarge: 'File too large. Compress or split the file and try again.',
+    fileTooLargeWithLimit: 'File too large. Please select a file no larger than {{limit}} MB.',
   },
   /**
    * The installed skills, as the product names them.
@@ -133,6 +135,7 @@ export const workbenchEn = {
     title: {
       'build-personal-skill': 'Build a personal Skill',
       'curriculum-planner': 'Series planning',
+      'zone-of-proximal-development': 'Practice lesson (zone of proximal development)',
       'stage-dsl': 'Classroom document structure',
       'deep-interactive': 'Deep interactive',
       'deep-research': 'Deep research',
@@ -397,6 +400,8 @@ export const workbenchZh = {
     remove: '移除 {{name}}',
     removeFailed: '移除上传失败材料',
     uploadFailed: '{{name}} 上传失败，请重试',
+    fileTooLarge: '文件过大，请压缩或拆分后重试。',
+    fileTooLargeWithLimit: '文件过大，请选择不超过 {{limit}}MB 的文件。',
   },
   skill: {
     listFailed: 'Skill 列表加载失败',
@@ -433,6 +438,7 @@ export const workbenchZh = {
     title: {
       'build-personal-skill': '创建专属 Skill',
       'curriculum-planner': '系列课规划',
+      'zone-of-proximal-development': '习题课（最近发展区）',
       'stage-dsl': '课堂文档结构',
       'deep-interactive': '深度交互',
       'deep-research': '深度调研',

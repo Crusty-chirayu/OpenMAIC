@@ -5,9 +5,11 @@ services:
       args:
         - ALPINE_MIRROR=${ALPINE_MIRROR:-}
         - NPM_REGISTRY=${NPM_REGISTRY:-}
-        # NEXT_PUBLIC_* values are compiled into the browser bundle. Leave them
-        # empty unless the corresponding client feature is explicitly enabled;
-        # persistence and other build-time flags can be supplied on the command line.
+        # NEXT_PUBLIC_* values are compiled into the browser bundle. Empty values
+        # follow each feature's documented default; explicit build-time overrides
+        # can be supplied on the command line.
+        # env_file below does not feed build args. For a legacy-chat rollback:
+        # NEXT_PUBLIC_PI_CHAT_ENABLED=false docker compose up -d --build openmaic
         - ALLOWED_FRAME_ANCESTORS=${ALLOWED_FRAME_ANCESTORS:-}
         - NEXT_PUBLIC_PERSISTENCE=${NEXT_PUBLIC_PERSISTENCE:-}
         - NEXT_PUBLIC_PERSISTENCE_TOKEN=${NEXT_PUBLIC_PERSISTENCE_TOKEN:-}
@@ -15,10 +17,12 @@ services:
         - NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED=${NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED:-}
         - NEXT_PUBLIC_MAIC_PLAYBACK_RENDERER_ENABLED=${NEXT_PUBLIC_MAIC_PLAYBACK_RENDERER_ENABLED:-}
         - NEXT_PUBLIC_PI_CHAT_ENABLED=${NEXT_PUBLIC_PI_CHAT_ENABLED:-}
+        - NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED=${NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED:-}
         - NEXT_PUBLIC_SHOW_VOCATIONAL_TEST_UI=${NEXT_PUBLIC_SHOW_VOCATIONAL_TEST_UI:-}
         - NEXT_PUBLIC_ENABLE_VIDEO_EXPORT=${NEXT_PUBLIC_ENABLE_VIDEO_EXPORT:-}
         - NEXT_PUBLIC_VIDEO_EXPORT_CTA_DESTINATION=${NEXT_PUBLIC_VIDEO_EXPORT_CTA_DESTINATION:-}
         - NEXT_PUBLIC_ENABLE_PPTX_IMPORT=${NEXT_PUBLIC_ENABLE_PPTX_IMPORT:-}
+        - NEXT_PUBLIC_PRO_WORKBENCH_ENABLED=${NEXT_PUBLIC_PRO_WORKBENCH_ENABLED:-}
     ports:
       - '3000:3000'
     env_file:
@@ -115,6 +119,12 @@ services:
       # RENDER_MAX_QUEUE cap. Set this >0 only with a trusted proxy supplying
       # per-user identity (see render-service/README.md).
       - RENDER_MAX_JOBS_PER_USER=0
+      - RENDER_PREVIEW_TIMEOUT_MS=${RENDER_PREVIEW_TIMEOUT_MS:-20000}
+      - RENDER_PREVIEW_MAX_IN_FLIGHT=${RENDER_PREVIEW_MAX_IN_FLIGHT:-8}
+      # Preview callers send a durable owner identity in x-openmaic-client, so
+      # keep this per-owner guard enabled. Set it to 0 only in deployments that
+      # call /preview without an owner identity.
+      - RENDER_PREVIEW_MAX_PER_USER=${RENDER_PREVIEW_MAX_PER_USER:-2}
     # Bound RAM: each render (Chromium + FFmpeg + archive expansion) is memory-heavy.
     # The standard profile requires 8 GiB. For the explicit low-memory profile,
     # set RENDER_RESOURCE_PROFILE=low-memory and RENDER_SERVICE_MEMORY_LIMIT=4g.

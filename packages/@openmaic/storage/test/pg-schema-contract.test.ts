@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { AGENT_SESSION_PG_SCHEMA, ensureAgentSessionSchema } from '../src/agent-session/pg.js';
+import { ASSET_PG_SCHEMA, ensureAssetSchema } from '../src/asset/pg.js';
 import {
   DOCUMENT_PG_SCHEMA,
   ensureDocumentSchema,
@@ -15,7 +16,7 @@ import {
 import type { Queryable } from '../src/runtime/pg.js';
 
 /**
- * Golden pins for the two PostgreSQL schemas this package exports.
+ * Golden pins for the PostgreSQL schemas this package exports.
  *
  * Both constants are public API. A deployment that provisions these tables with
  * its own migration tooling — rather than by calling `ensureDocumentSchema()` /
@@ -245,6 +246,8 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   id                  TEXT PRIMARY KEY,
   owner_id            TEXT NOT NULL,
   prompt              TEXT NOT NULL,
+  title               TEXT,
+  title_state         TEXT NOT NULL DEFAULT 'manual',
   stage_id            TEXT NOT NULL,
   active_stage_id     TEXT,
   skill_id            TEXT,
@@ -262,12 +265,56 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at          TIMESTAMPTZ,
   CONSTRAINT agent_sessions_attempt_nonnegative CHECK (attempt >= 0),
+  CONSTRAINT agent_sessions_title_state_known
+    CHECK (title_state IN ('pending','automatic','manual')),
   CONSTRAINT agent_sessions_status_known
     CHECK (status IN ('queued','running','succeeded','failed','cancelled'))
 );
 
 ALTER TABLE agent_sessions
   ADD COLUMN IF NOT EXISTS delivered_user_message_seq INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE agent_sessions
+  ADD COLUMN IF NOT EXISTS title TEXT;
+
+ALTER TABLE agent_sessions
+  ADD COLUMN IF NOT EXISTS title_state TEXT NOT NULL DEFAULT 'manual';
+
+DO $agent_session_title_state_constraint$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'agent_sessions'::regclass
+      AND conname = 'agent_sessions_title_state_known'
+  ) THEN
+    LOCK TABLE agent_sessions IN ACCESS EXCLUSIVE MODE;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'agent_sessions'::regclass
+        AND conname = 'agent_sessions_title_state_known'
+    ) THEN
+      ALTER TABLE agent_sessions
+        ADD CONSTRAINT agent_sessions_title_state_known
+        CHECK (title_state IN ('pending','automatic','manual'))
+        NOT VALID;
+    END IF;
+  END IF;
+END
+$agent_session_title_state_constraint$;
+
+DO $agent_session_title_state_validation$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'agent_sessions'::regclass
+      AND conname = 'agent_sessions_title_state_known'
+      AND NOT convalidated
+  ) THEN
+    ALTER TABLE agent_sessions
+      VALIDATE CONSTRAINT agent_sessions_title_state_known;
+  END IF;
+END
+$agent_session_title_state_validation$;
 
 CREATE INDEX IF NOT EXISTS agent_sessions_status_live_idx
   ON agent_sessions (status, created_at) WHERE deleted_at IS NULL;
@@ -321,14 +368,67 @@ CREATE TABLE IF NOT EXISTS agent_owner_session_events (
   attempt    INTEGER,
   data       JSONB NOT NULL,
   PRIMARY KEY (owner_id, id),
-  CONSTRAINT agent_owner_session_events_type_known CHECK (type IN
+  CONSTRAINT agent_owner_session_events_type_known_v2 CHECK (type IN
     ('session_created','session_status','session_deleted',
-     'session_active_stage','session_cancel_requested')),
+     'session_active_stage','session_cancel_requested','session_title')),
   CONSTRAINT agent_owner_session_events_status_known CHECK (status IS NULL OR status IN
     ('queued','running','succeeded','failed','cancelled')),
   CONSTRAINT agent_owner_session_events_attempt_nonnegative
     CHECK (attempt IS NULL OR attempt >= 0)
 );
+
+DO $agent_session_owner_event_type_constraint$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'agent_owner_session_events'::regclass
+      AND conname = 'agent_owner_session_events_type_known'::name
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'agent_owner_session_events'::regclass
+      AND conname = 'agent_owner_session_events_type_known_v2'
+  ) THEN
+    LOCK TABLE agent_owner_session_events IN ACCESS EXCLUSIVE MODE;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'agent_owner_session_events'::regclass
+        AND conname = 'agent_owner_session_events_type_known_v2'
+    ) THEN
+      ALTER TABLE agent_owner_session_events
+        ADD CONSTRAINT agent_owner_session_events_type_known_v2 CHECK (type IN
+          ('session_created','session_status','session_deleted',
+           'session_active_stage','session_cancel_requested','session_title'))
+        NOT VALID;
+    END IF;
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'agent_owner_session_events'::regclass
+        AND conname = 'agent_owner_session_events_type_known'::name
+    ) THEN
+      ALTER TABLE agent_owner_session_events
+        DROP CONSTRAINT agent_owner_session_events_type_known;
+    END IF;
+  END IF;
+END
+$agent_session_owner_event_type_constraint$;
+
+-- Installing the superset above is a catalog-only operation while the short
+-- ACCESS EXCLUSIVE lock is held. Validate separately so PostgreSQL scans an
+-- existing projection table under VALIDATE CONSTRAINT's weaker lock instead.
+-- Once validated, later initializers avoid taking that table lock altogether.
+DO $agent_session_owner_event_type_validation$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'agent_owner_session_events'::regclass
+      AND conname = 'agent_owner_session_events_type_known_v2'
+      AND NOT convalidated
+  ) THEN
+    ALTER TABLE agent_owner_session_events
+      VALIDATE CONSTRAINT agent_owner_session_events_type_known_v2;
+  END IF;
+END
+$agent_session_owner_event_type_validation$;
 
 CREATE TABLE IF NOT EXISTS agent_session_urls (
   session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -377,6 +477,7 @@ CREATE TABLE IF NOT EXISTS agent_session_materials (
   session_id    TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
   kind          TEXT NOT NULL,
   title         TEXT,
+  owner_material_id TEXT,
   source_url    TEXT,
   text_asset_id TEXT,
   raw_asset_id  TEXT,
@@ -399,8 +500,14 @@ CREATE TABLE IF NOT EXISTS agent_session_materials (
   ,CONSTRAINT agent_session_materials_extraction_attempts_nonnegative CHECK (extraction_attempts >= 0)
 );
 
+ALTER TABLE agent_session_materials ADD COLUMN IF NOT EXISTS owner_material_id TEXT;
+
 CREATE INDEX IF NOT EXISTS agent_session_materials_session_created_idx
   ON agent_session_materials (session_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_session_materials_session_owner_material_idx
+  ON agent_session_materials (session_id, owner_material_id)
+  WHERE owner_material_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS agent_session_materials_extraction_queue_idx
   ON agent_session_materials (created_at)
@@ -426,6 +533,199 @@ function statementsOf(schema: string): string[] {
   // dollar-quoted plpgsql trigger bodies into bogus statements.
   return splitSqlStatements(schema);
 }
+
+describe('agent-session constraint migrations', () => {
+  it('guards title-state installation and validates it in a separate statement', () => {
+    const statements = statementsOf(AGENT_SESSION_PG_SCHEMA);
+    const installIndex = statements.findIndex((statement) =>
+      statement.includes('$agent_session_title_state_constraint$'),
+    );
+    const validationIndex = statements.findIndex((statement) =>
+      statement.includes('$agent_session_title_state_validation$'),
+    );
+    const install = statements[installIndex] ?? '';
+    const validation = statements[validationIndex] ?? '';
+
+    expect(installIndex).toBeGreaterThanOrEqual(0);
+    expect(install.indexOf('IF NOT EXISTS')).toBeLessThan(
+      install.indexOf('LOCK TABLE agent_sessions IN ACCESS EXCLUSIVE MODE'),
+    );
+    expect(install).toMatch(/ADD CONSTRAINT agent_sessions_title_state_known[\s\S]*NOT VALID/);
+    expect(validationIndex).toBeGreaterThan(installIndex);
+    expect(validation).toContain('AND NOT convalidated');
+    expect(validation).toMatch(
+      /ALTER TABLE agent_sessions\s+VALIDATE CONSTRAINT agent_sessions_title_state_known/,
+    );
+  });
+
+  it('installs without a locked scan, then conditionally validates in a separate statement', () => {
+    const statements = statementsOf(AGENT_SESSION_PG_SCHEMA);
+    const installIndex = statements.findIndex((statement) =>
+      statement.includes('$agent_session_owner_event_type_constraint$'),
+    );
+    const validationIndex = statements.findIndex((statement) =>
+      statement.includes('$agent_session_owner_event_type_validation$'),
+    );
+    const install = statements[installIndex] ?? '';
+    const validation = statements[validationIndex] ?? '';
+    const addIndex = install.indexOf('ADD CONSTRAINT agent_owner_session_events_type_known_v2');
+    const notValidIndex = install.indexOf('NOT VALID', addIndex);
+    const dropIndex = install.indexOf(
+      'DROP CONSTRAINT agent_owner_session_events_type_known',
+      addIndex,
+    );
+
+    expect(installIndex).toBeGreaterThanOrEqual(0);
+    expect(addIndex).toBeGreaterThanOrEqual(0);
+    expect(notValidIndex).toBeGreaterThan(addIndex);
+    expect(dropIndex).toBeGreaterThan(notValidIndex);
+    expect(validationIndex).toBeGreaterThan(installIndex);
+    expect(validation).toContain('AND NOT convalidated');
+    expect(validation).toMatch(
+      /ALTER TABLE agent_owner_session_events\s+VALIDATE CONSTRAINT agent_owner_session_events_type_known_v2/,
+    );
+  });
+});
+
+/**
+ * The asset schema is an ARRAY of one-statement strings rather than one DDL
+ * string, because its statements must reach PGlite one at a time. It gets its
+ * own pin for that reason alone; the obligations are identical to the ones the
+ * shared block below asserts.
+ */
+const EXPECTED_ASSET_PG_SCHEMA: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS asset_blobs (
+     content_hash TEXT PRIMARY KEY,
+     byte_size BIGINT NOT NULL,
+     bytes BYTEA,
+     unreferenced_at TIMESTAMPTZ
+   )`,
+  `CREATE TABLE IF NOT EXISTS asset_entries (
+     id TEXT PRIMARY KEY,
+     principal TEXT NOT NULL,
+     content_hash TEXT NOT NULL REFERENCES asset_blobs(content_hash),
+     mime TEXT NOT NULL,
+     meta JSONB NOT NULL,
+     revision INTEGER NOT NULL DEFAULT 1,
+     created_at DOUBLE PRECISION NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS asset_entries_principal_idx
+     ON asset_entries (principal, id)`,
+  `CREATE INDEX IF NOT EXISTS asset_entries_content_hash_idx
+     ON asset_entries (content_hash)`,
+  `CREATE INDEX IF NOT EXISTS asset_blobs_unreferenced_idx
+     ON asset_blobs (unreferenced_at) WHERE unreferenced_at IS NOT NULL`,
+  `ALTER TABLE asset_entries
+     ADD COLUMN IF NOT EXISTS committed_at TIMESTAMPTZ`,
+  `ALTER TABLE asset_entries
+     ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`,
+  `ALTER TABLE asset_entries
+     ADD COLUMN IF NOT EXISTS unreferenced_at TIMESTAMPTZ`,
+  `CREATE TABLE IF NOT EXISTS document_asset_refs (
+     stage_id TEXT NOT NULL,
+     scope TEXT NOT NULL CHECK (scope IN ('stage', 'scene')),
+     scene_id TEXT NOT NULL,
+     asset_id TEXT NOT NULL REFERENCES asset_entries(id) ON DELETE CASCADE,
+     PRIMARY KEY (stage_id, scope, scene_id, asset_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS document_asset_refs_asset_idx
+     ON document_asset_refs (asset_id)`,
+  `CREATE INDEX IF NOT EXISTS asset_entries_expires_idx
+     ON asset_entries (expires_at) WHERE expires_at IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS asset_entries_unreferenced_idx
+     ON asset_entries (unreferenced_at) WHERE unreferenced_at IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS asset_entries_legacy_idx
+     ON asset_entries (id) WHERE committed_at IS NULL AND expires_at IS NULL`,
+  `CREATE TABLE IF NOT EXISTS asset_reference_tracking (
+     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+     enabled_at TIMESTAMPTZ NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS document_asset_withdrawals (
+     stage_id TEXT NOT NULL PRIMARY KEY,
+     withdrawn_at TIMESTAMPTZ NOT NULL
+   )`,
+];
+
+describe('ASSET_PG_SCHEMA is a pinned contract', () => {
+  it('is exactly what ensureAssetSchema provisions', async () => {
+    const { statements, queryable } = recordingQueryable();
+    await ensureAssetSchema(queryable);
+
+    expect(statements).toEqual([...EXPECTED_ASSET_PG_SCHEMA]);
+  });
+
+  it('provisions idempotently on a second call', async () => {
+    const { statements, queryable } = recordingQueryable();
+    await ensureAssetSchema(queryable);
+    await ensureAssetSchema(queryable);
+
+    expect(statements).toEqual([...EXPECTED_ASSET_PG_SCHEMA, ...EXPECTED_ASSET_PG_SCHEMA]);
+  });
+
+  it('matches the published DDL verbatim', () => {
+    // A failure here is not a broken test: it means the schema changed. Update
+    // this pin in the same change, and treat it as a breaking change for any
+    // deployment that provisions these tables through its own migrations.
+    expect(ASSET_PG_SCHEMA).toEqual(EXPECTED_ASSET_PG_SCHEMA);
+  });
+
+  it('keeps every statement guarded, single, and PGlite-compatible', () => {
+    expect(ASSET_PG_SCHEMA.length).toBeGreaterThan(0);
+    for (const statement of ASSET_PG_SCHEMA) {
+      // One statement per entry: the ensure function issues them individually,
+      // so an embedded semicolon would send two statements as one query.
+      expect(statement.includes(';'), `not a single statement: ${statement}`).toBe(false);
+      const sql = statement.trim();
+      expect(
+        /^CREATE (TABLE|INDEX|UNIQUE INDEX) IF NOT EXISTS /.test(sql) ||
+          /^ALTER TABLE [a-z_]+\s+ADD COLUMN IF NOT EXISTS /.test(sql),
+        `ASSET_PG_SCHEMA statement is not an idempotent create or additive migration: ${statement}`,
+      ).toBe(true);
+    }
+  });
+
+  it('keys the reference table on a scope column rather than a reserved scene id', () => {
+    // The stage-level and scene-level rows must be distinguishable by a column
+    // the document cannot forge. Keying on `scene_id` alone would let a scene
+    // whose id equals the stage sentinel share a key with the stage's rows,
+    // and the scope written second would delete the other's.
+    const refs = ASSET_PG_SCHEMA.find((statement) =>
+      statement.startsWith('CREATE TABLE IF NOT EXISTS document_asset_refs'),
+    );
+
+    expect(refs).toContain(`scope TEXT NOT NULL CHECK (scope IN ('stage', 'scene'))`);
+    expect(refs).toContain('PRIMARY KEY (stage_id, scope, scene_id, asset_id)');
+  });
+
+  it('indexes the legacy-entry gate the collector asks on every pass', () => {
+    // Without this the steady-state pass sequentially scans every entry,
+    // forever, to answer a question whose answer is almost always "none".
+    expect(ASSET_PG_SCHEMA).toContain(
+      `CREATE INDEX IF NOT EXISTS asset_entries_legacy_idx
+     ON asset_entries (id) WHERE committed_at IS NULL AND expires_at IS NULL`,
+    );
+  });
+
+  it('creates every table before the statements that reference it', () => {
+    // The array is in dependency order, and document_asset_refs' foreign key
+    // is the one dependency a reordering could break silently: PostgreSQL
+    // would refuse the CREATE TABLE, but only against a database that had not
+    // already been provisioned by an earlier release.
+    const entries = ASSET_PG_SCHEMA.findIndex((statement) =>
+      statement.startsWith('CREATE TABLE IF NOT EXISTS asset_entries'),
+    );
+    const blobs = ASSET_PG_SCHEMA.findIndex((statement) =>
+      statement.startsWith('CREATE TABLE IF NOT EXISTS asset_blobs'),
+    );
+    const refs = ASSET_PG_SCHEMA.findIndex((statement) =>
+      statement.startsWith('CREATE TABLE IF NOT EXISTS document_asset_refs'),
+    );
+
+    expect(blobs).toBeGreaterThanOrEqual(0);
+    expect(entries).toBeGreaterThan(blobs);
+    expect(refs).toBeGreaterThan(entries);
+  });
+});
 
 const schemas = [
   {
@@ -494,10 +794,23 @@ describe.each(schemas)('$name is a pinned contract', ({ name, actual, expected, 
     for (const statement of statements) {
       // The splitter keeps leading `--` comment lines attached to the
       // statement that follows them; strip them before judging the DDL.
-      const sql = statement.replace(/^(--[^\n]*\n?)+/, '').trim();
+      const sql = statement
+        .trim()
+        .replace(/^(--[^\n]*\n?)+/, '')
+        .trim();
+      const localConstraintMigration =
+        /^DO \$agent_session_[a-z_]+_constraint\$/.test(sql) &&
+        /LOCK TABLE [a-z0-9_]+ IN ACCESS EXCLUSIVE MODE/.test(sql) &&
+        /IF NOT EXISTS/.test(sql);
+      const constraintValidation =
+        /^DO \$agent_session_[a-z_]+_validation\$/.test(sql) &&
+        /AND NOT convalidated/.test(sql) &&
+        /VALIDATE CONSTRAINT [a-z0-9_]+/.test(sql);
       expect(
         /^CREATE (TABLE|INDEX|UNIQUE INDEX) IF NOT EXISTS /.test(sql) ||
           /^ALTER TABLE [a-z_]+\s+ADD COLUMN IF NOT EXISTS /.test(sql) ||
+          localConstraintMigration ||
+          constraintValidation ||
           /^CREATE OR REPLACE FUNCTION /.test(sql) ||
           /^DROP TRIGGER IF EXISTS /.test(sql) ||
           // CREATE TRIGGER is made idempotent by the paired DROP TRIGGER IF

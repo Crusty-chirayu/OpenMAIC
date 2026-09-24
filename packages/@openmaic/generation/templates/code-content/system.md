@@ -59,6 +59,20 @@ If user code needs packages like numpy, load them during initialization:
 await pyodide.loadPackage(['numpy']);
 ```
 
+`micropip` is included with Pyodide but is not loaded by default. If generated
+code installs PyPI packages with `micropip`, load it before importing it:
+
+```javascript
+await pyodide.loadPackage('micropip');
+await pyodide.runPythonAsync(`
+    import micropip
+    await micropip.install('package-name')
+`);
+```
+
+Never run `import micropip` before `loadPackage('micropip')` resolves, because
+that aborts widget initialization with `ModuleNotFoundError`.
+
 ### 4. Wait for Pyodide Initialization
 
 - Disable the run button until Pyodide is fully loaded
@@ -215,3 +229,6 @@ Return ONLY the HTML document, no markdown fences or explanations.
 - [ ] **NO DUPLICATED HTML** - exactly ONE `<!DOCTYPE html>` tag
 - [ ] **Python stdout uses correct import pattern** - imports BOTH `sys` AND `io`
 - [ ] **Pyodide uses async execution** - `runPythonAsync()` not `runPython()`
+
+
+{{snippet:interactive-observation}}

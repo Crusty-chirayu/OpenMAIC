@@ -8,6 +8,7 @@ import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/compone
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useSettingsStore } from '@/lib/store/settings';
 import { VIDEO_PROVIDERS } from '@/lib/media/video-providers';
+import { useOpenRouterModels } from '@/lib/media/use-openrouter-models';
 import {
   Loader2,
   CheckCircle2,
@@ -53,7 +54,15 @@ export function VideoSettings({ selectedProviderId }: VideoSettingsProps) {
 
   const currentConfig = videoProvidersConfig[selectedProviderId];
   const currentProvider = VIDEO_PROVIDERS[selectedProviderId];
-  const builtInModels = currentProvider?.models || [];
+  // OpenRouter's catalog is fetched live so the picker is never a curated
+  // shortlist; every other provider keeps its registry list.
+  const { models: builtInModels } = useOpenRouterModels(
+    'video',
+    selectedProviderId === 'openrouter-video',
+    currentProvider?.models || [],
+    currentConfig?.apiKey,
+    currentConfig?.baseUrl,
+  );
   const customModels = useMemo(
     () => currentConfig?.customModels || [],
     [currentConfig?.customModels],
@@ -61,11 +70,17 @@ export function VideoSettings({ selectedProviderId }: VideoSettingsProps) {
   const isServerConfigured = !!currentConfig?.isServerConfigured;
 
   const handleApiKeyChange = (apiKey: string) => {
-    setVideoProviderConfig(selectedProviderId, { apiKey });
+    setVideoProviderConfig(selectedProviderId, {
+      apiKey,
+      ...(apiKey.trim() ? { enabled: true } : {}),
+    });
   };
 
   const handleBaseUrlChange = (baseUrl: string) => {
-    setVideoProviderConfig(selectedProviderId, { baseUrl });
+    setVideoProviderConfig(selectedProviderId, {
+      baseUrl,
+      ...(baseUrl.trim() ? { enabled: true } : {}),
+    });
   };
 
   const handleTest = async () => {
@@ -88,7 +103,7 @@ export function VideoSettings({ selectedProviderId }: VideoSettingsProps) {
         setTestMessage(t('settings.videoConnectivitySuccess'));
       } else {
         setTestStatus('error');
-        setTestMessage(`${t('settings.videoConnectivityFailed')}: ${data.message}`);
+        setTestMessage(`${t('settings.videoConnectivityFailed')}: ${data.error}`);
       }
     } catch (err) {
       setTestStatus('error');

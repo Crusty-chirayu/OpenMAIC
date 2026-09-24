@@ -79,6 +79,7 @@ export const LLM_ENV_MAP: Record<string, string> = {
   TENCENT_HUNYUAN: 'tencent-hunyuan',
   XIAOMI: 'xiaomi',
   MIMO: 'xiaomi',
+  TOKENDANCE: 'tokendance',
   OLLAMA: 'ollama',
   LEMONADE: 'lemonade',
   BEDROCK: 'bedrock',
@@ -118,6 +119,7 @@ const IMAGE_ENV_MAP: Record<string, string> = {
   IMAGE_MINIMAX: 'minimax-image',
   IMAGE_GROK: 'grok-image',
   IMAGE_LEMONADE: 'lemonade',
+  IMAGE_OPENROUTER: 'openrouter-image',
 };
 
 const VIDEO_ENV_MAP: Record<string, string> = {
@@ -127,10 +129,12 @@ const VIDEO_ENV_MAP: Record<string, string> = {
   VIDEO_MINIMAX: 'minimax-video',
   VIDEO_GROK: 'grok-video',
   VIDEO_HAPPYHORSE: 'happyhorse',
+  VIDEO_OPENROUTER: 'openrouter-video',
 };
 
 const WEB_SEARCH_ENV_MAP: Record<string, string> = {
   TAVILY: 'tavily',
+  EXA: 'exa',
   BOCHA: 'bocha',
   BRAVE: 'brave',
   BAIDU: 'baidu',
@@ -893,10 +897,16 @@ export function resolveImageModel(providerId: string, clientModel?: string): str
  * (presence = managed flag) plus operator force-disabled providers
  * (`{ disabled: true }`), mirroring the TTS listing — disable wins (#665).
  */
-export function getServerVideoProviders(): Record<string, { disabled?: boolean }> {
+export function getServerVideoProviders(): Record<
+  string,
+  { models?: string[]; disabled?: boolean }
+> {
   const cfg = getConfig();
-  const result: Record<string, { disabled?: boolean }> = {};
-  for (const id of Object.keys(cfg.video)) result[id] = {};
+  const result: Record<string, { models?: string[]; disabled?: boolean }> = {};
+  for (const [id, entry] of Object.entries(cfg.video)) {
+    result[id] = {};
+    if (entry.models && entry.models.length > 0) result[id].models = entry.models;
+  }
   for (const id of cfg.disabled.video) result[id] = { disabled: true };
   return result;
 }
@@ -1003,6 +1013,7 @@ export function resolveServerWebSearchProviderId(preferredProviderId?: string): 
     return preferredProviderId;
   }
   if (enabled('tavily') && webSearch.tavily?.apiKey) return 'tavily';
+  if (enabled('exa') && webSearch.exa?.apiKey) return 'exa';
   if (enabled('bocha') && webSearch.bocha?.apiKey) return 'bocha';
   if (enabled('baidu') && webSearch.baidu?.apiKey) return 'baidu';
   if (enabled('minimax') && webSearch.minimax?.apiKey) return 'minimax';

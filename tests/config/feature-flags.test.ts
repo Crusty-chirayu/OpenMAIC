@@ -3,6 +3,7 @@ import {
   isAgentRuntimeConfigured,
   isAgentRuntimeEnabled,
   isEditorRendererEnabled,
+  isCoursewareReferenceEnabled,
   isMaicEditorEnabled,
   isPlaybackRendererEnabled,
   isPiChatEnabled,
@@ -209,9 +210,12 @@ describe('isPiChatEnabled', () => {
     }
   });
 
-  it('defaults off when unset', () => {
+  it('defaults on when unset or empty', () => {
     delete process.env[flag];
-    expect(isPiChatEnabled()).toBe(false);
+    expect(isPiChatEnabled()).toBe(true);
+
+    process.env[flag] = '';
+    expect(isPiChatEnabled()).toBe(true);
   });
 
   it("returns true for 'true' and '1'", () => {
@@ -222,12 +226,50 @@ describe('isPiChatEnabled', () => {
     expect(isPiChatEnabled()).toBe(true);
   });
 
-  it('returns false for other values', () => {
+  it("returns false for 'false', '0', and other values", () => {
     process.env[flag] = 'false';
+    expect(isPiChatEnabled()).toBe(false);
+
+    process.env[flag] = '0';
     expect(isPiChatEnabled()).toBe(false);
 
     process.env[flag] = 'yes';
     expect(isPiChatEnabled()).toBe(false);
+  });
+});
+
+describe('isCoursewareReferenceEnabled', () => {
+  const flag = 'NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED';
+  let original: string | undefined;
+
+  beforeEach(() => {
+    original = process.env[flag];
+  });
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[flag];
+    else process.env[flag] = original;
+  });
+
+  it('defaults off when unset', () => {
+    delete process.env[flag];
+    expect(isCoursewareReferenceEnabled()).toBe(false);
+  });
+
+  it("returns true for 'true' and '1'", () => {
+    process.env[flag] = 'true';
+    expect(isCoursewareReferenceEnabled()).toBe(true);
+
+    process.env[flag] = '1';
+    expect(isCoursewareReferenceEnabled()).toBe(true);
+  });
+
+  it('returns false for other values', () => {
+    process.env[flag] = 'false';
+    expect(isCoursewareReferenceEnabled()).toBe(false);
+
+    process.env[flag] = 'yes';
+    expect(isCoursewareReferenceEnabled()).toBe(false);
   });
 });
 

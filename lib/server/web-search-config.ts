@@ -6,11 +6,13 @@ import {
   resolveWebSearchBaseUrl,
   resolveWebSearchModel,
 } from '@/lib/server/provider-config';
+import { TOKEN_PLAN_PRESETS } from '@/lib/config/token-plan-presets';
 import { WEB_SEARCH_PROVIDERS } from '@/lib/web-search/constants';
 import type { BaiduSubSources, WebSearchProviderId } from '@/lib/web-search/types';
 
 const OFFICIAL_CLIENT_BASE_URLS: Record<WebSearchProviderId, string[]> = {
   tavily: ['https://api.tavily.com', 'https://api.tavily.com/search'],
+  exa: ['https://api.exa.ai', 'https://api.exa.ai/search'],
   bocha: [
     'https://api.bocha.cn',
     'https://api.bocha.cn/v1',
@@ -42,6 +44,17 @@ const OFFICIAL_CLIENT_BASE_URLS: Record<WebSearchProviderId, string[]> = {
   searxng: [],
 };
 
+/**
+ * Base URLs that a built-in token plan writes into client settings are curated
+ * in-repo endpoints too, so applying a plan never produces a rejected config.
+ */
+function tokenPlanClientBaseUrls(providerId: WebSearchProviderId): string[] {
+  return TOKEN_PLAN_PRESETS.flatMap((preset) => {
+    const target = preset.modalities.webSearch;
+    return target?.providerId === providerId ? [target.baseUrl] : [];
+  });
+}
+
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, '');
 }
@@ -70,7 +83,10 @@ export function resolveSafeClientWebSearchBaseUrl(
     throw new Error(`Unsupported ${WEB_SEARCH_PROVIDERS[providerId].name} base URL`);
   }
 
-  const allowed = OFFICIAL_CLIENT_BASE_URLS[providerId].map(normalizeBaseUrl);
+  const allowed = [
+    ...OFFICIAL_CLIENT_BASE_URLS[providerId],
+    ...tokenPlanClientBaseUrls(providerId),
+  ].map(normalizeBaseUrl);
   if (!allowed.includes(normalized)) {
     throw new Error(`Unsupported ${WEB_SEARCH_PROVIDERS[providerId].name} base URL`);
   }

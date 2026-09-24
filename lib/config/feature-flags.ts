@@ -3,12 +3,16 @@
  * Next.js inlines at build time so they are safe to read from client
  * components. Server-only flags must not use the `NEXT_PUBLIC_` prefix.
  *
- * Truthy values: `'true'` or `'1'`. Anything else (including unset) is
- * treated as disabled.
+ * Truthy values: `'true'` or `'1'`. Unless a flag documents a different
+ * default, anything else (including unset) is treated as disabled.
  */
 
 function readBoolean(envValue: string | undefined): boolean {
   return envValue === 'true' || envValue === '1';
+}
+
+function readDefaultOnBoolean(envValue: string | undefined): boolean {
+  return envValue === undefined || envValue === '' || readBoolean(envValue);
 }
 
 /**
@@ -22,6 +26,23 @@ export function isAgentRuntimeEnabled(): boolean {
 /** The Node runtime can start the runner only with a non-empty database URL. */
 export function isAgentRuntimeConfigured(): boolean {
   return isAgentRuntimeEnabled() && Boolean(process.env.DATABASE_URL?.trim());
+}
+
+/**
+ * Server-side persistence is available: documents, runtime rows and assets are
+ * durable and owner-scoped. This is the same condition the persistence route
+ * itself keys on, and it is strictly weaker than
+ * {@link isAgentRuntimeConfigured} — every deployment that runs the agent
+ * runtime also has persistence, but persistence runs perfectly well without it.
+ *
+ * Anything that describes a persisted course (who owns it, whether it is
+ * published) must gate on THIS, not on the agent runtime: the persistence
+ * route resolves an owner for every request and the owner-bound document store
+ * records one for every course, so those facts exist whether or not the runtime
+ * is enabled.
+ */
+export function isServerPersistenceConfigured(): boolean {
+  return Boolean(process.env.DATABASE_URL?.trim());
 }
 
 /**
@@ -66,11 +87,22 @@ export function isEditorRendererEnabled(): boolean {
 }
 
 /**
- * Experimental Pi-based classroom chat runtime. Default OFF. The same public
- * flag selects the client runtime and gates the corresponding server route.
+ * Pi-based classroom chat runtime. Default ON. The same public flag selects
+ * the client runtime and gates the corresponding server route. Operators can
+ * set it to `false` or `0` and rebuild to roll back to the legacy runtime.
+ * next.config.ts pins the default too, so runtime-only overrides cannot split
+ * the built client's choice from the server route gate.
  */
 export function isPiChatEnabled(): boolean {
-  return readBoolean(process.env.NEXT_PUBLIC_PI_CHAT_ENABLED);
+  return readDefaultOnBoolean(process.env.NEXT_PUBLIC_PI_CHAT_ENABLED);
+}
+
+/**
+ * Unified playback courseware-reference gate for PPT and Interactive scenes.
+ * Default OFF and independently disableable while Pi chat remains available.
+ */
+export function isCoursewareReferenceEnabled(): boolean {
+  return readBoolean(process.env.NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED);
 }
 
 /**
